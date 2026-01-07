@@ -1,8 +1,8 @@
-# TxtOnScrn
+# TextOnScreen
 
 **TxtOnScrn** is a specialized desktop application I designed for efficient text extraction and processing from the screen. This tool instantly converts visual content into editable text using OCR and allows for subsequent analysis using artificial intelligence.
 
-I must admit that the vast majority of the work on this project was performed by **Google Copilot**.
+I must admit that the vast majority of the work on this project was performed by **Github Copilot**.
 
 ## Purpose and Usage
 I created this as a formal and, if I may say so, **"quite useful"** solution for users who need to quickly digitize text from images, presentations, or error messages and work with it further. The application runs in the background in the System Tray and is ready for use at any time via a global keyboard shortcut.

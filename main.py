@@ -174,7 +174,7 @@ def _dpapi_decrypt_from_b64(value: str) -> str:
 
 
 def get_windows_theme_mode() -> str:
-    """Vrátí 'light' nebo 'dark' podle nastavení Windows (AppsUseLightTheme)."""
+    """Returns 'light' or 'dark' based on Windows settings (AppsUseLightTheme)."""
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -189,7 +189,7 @@ def get_windows_theme_mode() -> str:
 
 
 def apply_theme_mode(mode: str) -> None:
-    """Aplikuje paletu pro 'light'/'dark'. Pro 'system' použije Windows režim."""
+    """Applies 'light'/'dark' palette. Uses Windows mode for 'system'."""
     app = QApplication.instance()
     if app is None:
         return
@@ -246,24 +246,24 @@ def resource_path(name: str) -> str:
 
 
 def setup_tesseract():
-    """Konfiguruje cestu k Tesseract OCR binárce."""
+    """Configures the path to the Tesseract OCR binary."""
     if not HAS_TESSERACT:
         return False
         
-    # 1. Zkusíme najít Tesseract přibalený v aplikaci (pro EXE verzi)
-    # Předpokládáme, že složka "Tesseract-OCR" je přibalena v rootu
+    # 1. Try to find bundled Tesseract (for EXE version)
+    # Assume "Tesseract-OCR" folder is bundled in root
     internal_tess = resource_path(os.path.join("Tesseract-OCR", "tesseract.exe"))
     if os.path.exists(internal_tess):
         pytesseract.pytesseract.tesseract_cmd = internal_tess
         return True
         
-    # 2. Pokud není přibalený (běžíme ve VS Code), zkusíme vedle skriptu
+    # 2. If not bundled (running in VS Code), try next to script
     local_tess = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Tesseract-OCR", "tesseract.exe")
     if os.path.exists(local_tess):
         pytesseract.pytesseract.tesseract_cmd = local_tess
         return True
 
-    # 3. Fallback: Zkusíme systémové cesty
+    # 3. Fallback: Try system paths
     possible_paths = [
         r'C:\Program Files\Tesseract-OCR\tesseract.exe',
         r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe'
@@ -275,7 +275,7 @@ def setup_tesseract():
             
     return False
 
-# Inicializace tesseractu při startu
+# Initialize tesseract on startup
 setup_tesseract()
 
 
@@ -308,7 +308,7 @@ def is_startup_enabled() -> bool:
 
 def set_startup_enabled(enabled: bool) -> None:
     command = get_startup_command()
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Nastavuji startup: {enabled} -> {command}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Setting startup: {enabled} -> {command}")
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
             if enabled:
@@ -319,7 +319,7 @@ def set_startup_enabled(enabled: bool) -> None:
                 except FileNotFoundError:
                     pass
     except OSError as e:
-        print(f"Chyba registru: {e}")
+        print(f"Registry error: {e}")
 
 
 class ConfigTab(QWidget):
@@ -430,9 +430,9 @@ class SettingsDialog(QDialog):
 
         local_group = QGroupBox("Local")
         local_layout = QVBoxLayout(local_group)
-        self.ai_ollama_cb = QCheckBox("Ollama (lokální server)")
-        self.ai_lmstudio_cb = QCheckBox("LM Studio (lokální server)")
-        self.ai_localai_cb = QCheckBox("LocalAI (OpenAI-compatible, lokálně)")
+        self.ai_ollama_cb = QCheckBox("Ollama (local server)")
+        self.ai_lmstudio_cb = QCheckBox("LM Studio (local server)")
+        self.ai_localai_cb = QCheckBox("LocalAI (OpenAI-compatible, local)")
 
         self.ai_ollama_cb.toggled.connect(lambda checked: self.on_local_provider_toggled(self.ai_ollama_cb, SETTINGS_AI_OLLAMA_ENABLED, checked))
         self.ai_lmstudio_cb.toggled.connect(lambda checked: self.on_local_provider_toggled(self.ai_lmstudio_cb, SETTINGS_AI_LMSTUDIO_ENABLED, checked))
@@ -461,7 +461,7 @@ class SettingsDialog(QDialog):
         public_key_row.addWidget(self.public_api_key_label)
         self.public_api_key_edit = QLineEdit()
         self.public_api_key_edit.setEchoMode(QLineEdit.Password)
-        self.public_api_key_edit.setPlaceholderText("Vyber providera a vlož API key…")
+        self.public_api_key_edit.setPlaceholderText("Select provider and enter API key…")
         self.public_api_key_edit.textChanged.connect(self.on_public_key_changed)
         public_key_row.addWidget(self.public_api_key_edit, 1)
 
@@ -479,11 +479,11 @@ class SettingsDialog(QDialog):
 
         public_buttons = QHBoxLayout()
         public_buttons.addStretch()
-        self.ai_login_btn = QPushButton("Přihlásit účet")
+        self.ai_login_btn = QPushButton("Log in")
         self.ai_login_btn.clicked.connect(self.on_ai_login_clicked)
         public_buttons.addWidget(self.ai_login_btn)
 
-        self.ai_get_key_btn = QPushButton("Získat API klíč")
+        self.ai_get_key_btn = QPushButton("Get API Key")
         self.ai_get_key_btn.clicked.connect(self.on_ai_get_key_clicked)
         public_buttons.addWidget(self.ai_get_key_btn)
 
@@ -577,7 +577,7 @@ class SettingsDialog(QDialog):
     def on_ai_login_clicked(self) -> None:
         provider = self._get_selected_public_provider()
         if not provider:
-            QMessageBox.information(self, "Přihlášení", "Vyber providera v sekci Public.")
+            QMessageBox.information(self, "Login", "Select a provider in the Public section.")
             return
 
         url = {
@@ -590,7 +590,7 @@ class SettingsDialog(QDialog):
     def on_ai_get_key_clicked(self) -> None:
         provider = self._get_selected_public_provider()
         if not provider:
-            QMessageBox.information(self, "API key", "Vyber providera v sekci Public.")
+            QMessageBox.information(self, "API key", "Select a provider in the Public section.")
             return
 
         url = {
@@ -603,12 +603,12 @@ class SettingsDialog(QDialog):
     def on_ai_test_key_clicked(self) -> None:
         provider = self._get_selected_public_provider()
         if not provider:
-            QMessageBox.information(self, "Test key", "Vyber providera v sekci Public.")
+            QMessageBox.information(self, "Test key", "Select a provider in the Public section.")
             return
 
         api_key = (self.public_api_key_edit.text() or "").strip()
         if not api_key:
-            QMessageBox.information(self, "Test key", "Nejdřív vlož API key.")
+            QMessageBox.information(self, "Test key", "Enter API key first.")
             return
 
         self.public_status_label.setText("Testing…")
@@ -711,7 +711,7 @@ class SettingsDialog(QDialog):
             self.public_api_key_edit.blockSignals(True)
             self.public_api_key_edit.setText("")
             self.public_api_key_edit.blockSignals(False)
-            self.public_status_label.setText("Vyber providera v sekci Public.")
+            self.public_status_label.setText("Select a provider in the Public section.")
             return
 
         stored = str(self.settings.value(setting_key, "") or "")
@@ -872,13 +872,13 @@ class AssistantDialog(QDialog):
         self.resize(640, 420)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Zadej úkol/otázku (může být i mimo text)."))
+        layout.addWidget(QLabel("Enter task/question (can be unrelated to text)."))
 
         self.task_edit = QTextEdit()
-        self.task_edit.setPlaceholderText("Např.: Shrň text do 5 bodů. / Oprav překlepy. / Vysvětli, co znamená... ")
+        self.task_edit.setPlaceholderText("E.g.: Summarize into 5 points. / Fix typos. / Explain what this means... ")
         layout.addWidget(self.task_edit, 1)
 
-        layout.addWidget(QLabel("Výstup:"))
+        layout.addWidget(QLabel("Output:"))
         self.output_edit = QTextEdit()
         self.output_edit.setReadOnly(True)
         layout.addWidget(self.output_edit, 2)
@@ -902,20 +902,20 @@ class AssistantDialog(QDialog):
             editor_text = ""
 
         if not task:
-            self.output_edit.setPlainText("Zadej prosím úkol/otázku.")
+            self.output_edit.setPlainText("Please enter a task/question.")
             return
 
         if self.mode == "public":
             self._run_public(task=task, editor_text=editor_text)
             return
 
-        # Local Assistant: jednoduché offline operace s textem (bez externích API)
+        # Local Assistant: simple offline text operations (no external APIs)
         text = (editor_text or "").strip()
         if not text:
             self.output_edit.setPlainText(
-                "Editor text je prázdný.\n\n"
-                f"Úkol: {task}\n"
-                "Tip: Nejprve vlož text do editoru, pak zkus třeba: 'Shrň do 5 bodů'."
+                "Editor text is empty.\n\n"
+                f"Task: {task}\n"
+                "Tip: First paste text into the editor, then try e.g.: 'Summarize into 5 points'."
             )
             return
 
@@ -924,13 +924,13 @@ class AssistantDialog(QDialog):
         if "shrň" in task_l or "shrnout" in task_l or "summary" in task_l or "summarize" in task_l:
             take = min(5, len(lines))
             summary = "\n".join(f"- {lines[i][:200]}" for i in range(take))
-            self.output_edit.setPlainText(summary if summary else "(Není co shrnout.)")
+            self.output_edit.setPlainText(summary if summary else "(Nothing to summarize.)")
             return
 
         if "odráž" in task_l or "body" in task_l or "bullet" in task_l:
             take = min(10, len(lines))
             bullets = "\n".join(f"- {lines[i][:200]}" for i in range(take))
-            self.output_edit.setPlainText(bullets if bullets else "(Není co vypsat.)")
+            self.output_edit.setPlainText(bullets if bullets else "(Nothing to list.)")
             return
 
         if "vyčisti" in task_l or "očisti" in task_l or "cleanup" in task_l:
@@ -939,9 +939,9 @@ class AssistantDialog(QDialog):
             return
 
         self.output_edit.setPlainText(
-            "Local Assistant umí zatím jen jednoduché offline operace.\n"
-            "Zkus třeba: 'Shrň', 'Udělej odrážky', 'Vyčisti'.\n\n"
-            f"Úkol: {task}"
+            "Local Assistant currently supports only simple offline operations.\n"
+            "Try: 'Summarize', 'Bullet points', 'Cleanup'.\n\n"
+            f"Task: {task}"
         )
 
     def _run_public(self, task: str, editor_text: str) -> None:
@@ -950,8 +950,8 @@ class AssistantDialog(QDialog):
         provider = self._get_selected_public_provider(settings)
         if provider != "gemini":
             self.output_edit.setPlainText(
-                "Public Assistant je teď napojený pouze na Gemini.\n"
-                "Vyber v Settings → AI → Public: Google Gemini."
+                "Public Assistant is currently connected only to Gemini.\n"
+                "Select in Settings → AI → Public: Google Gemini."
             )
             return
 
@@ -959,8 +959,8 @@ class AssistantDialog(QDialog):
         api_key = _dpapi_decrypt_from_b64(encrypted).strip()
         if not api_key:
             self.output_edit.setPlainText(
-                "Chybí Gemini API key.\n"
-                "Jdi do Settings → AI → Public, vyber Google Gemini a vlož API key."
+                "Missing Gemini API key.\n"
+                "Go to Settings → AI → Public, select Google Gemini and enter API key."
             )
             return
 
@@ -991,13 +991,13 @@ class AssistantDialog(QDialog):
         text = (editor_text or "").strip()
         if text:
             return (
-                "Jsi asistent. Uživatel ti dává úkol a také text z editoru. "
-                "Když úkol souvisí s textem, pracuj s ním.\n\n"
-                f"Úkol: {task}\n\n"
-                "Text z editoru:\n"
+                "You are an assistant. The user gives you a task and also text from the editor. "
+                "If the task relates to the text, work with it.\n\n"
+                f"Task: {task}\n\n"
+                "Text from editor:\n"
                 f"{text}"
             )
-        return f"Úkol: {task}"
+        return f"Task: {task}"
 
     def _gemini_generate(self, api_key: str, prompt: str) -> str:
         # Model choice: prefer a fast generally-available model name.
@@ -1324,16 +1324,16 @@ class SnippingOverlay(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setAttribute(Qt.WA_DeleteOnClose)
         
-        # Zachytit celou obrazovku (všechny monitory)
+        # Capture full screen (all monitors)
         screens = QApplication.screens()
         
-        # Zjistit celkovou geometrii všech monitorů
+        # Determine total geometry of all monitors
         total_rect = QRect()
         for screen in screens:
             total_rect = total_rect.united(screen.geometry())
         self.total_rect = total_rect
             
-        # Zjistit největší pixel ratio (scale factor)
+        # Determine largest pixel ratio (scale factor)
         self.max_dpr = max(s.devicePixelRatio() for s in screens) if screens else 1.0
         
         # Store screen captures and their layout info
@@ -1346,18 +1346,18 @@ class SnippingOverlay(QWidget):
         current_phys_x = 0
         max_phys_y = 0
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Detekce monitorů:")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Monitor detection:")
         for i, screen in enumerate(sorted_screens):
             geo = screen.geometry()
             dpr = screen.devicePixelRatio()
-            print(f"  Monitor {i}: Logická geom={geo.getRect()}, DPR={dpr}")
+            print(f"  Monitor {i}: Logical geom={geo.getRect()}, DPR={dpr}")
         
         for screen in sorted_screens:
             # Grab raw physical pixels
             pix = screen.grabWindow(0)
             
-            # Nastavíme DPR pro pixmapu, aby odpovídalo monitoru
-            # Tím zajistíme, že logická velikost pixmapy odpovídá logické geometrii okna
+            # Set DPR for pixmap to match monitor
+            # This ensures logical size of pixmap matches logical geometry of window
             pix.setDevicePixelRatio(screen.devicePixelRatio())
             
             # Logical geometry relative to the overlay window
@@ -1379,9 +1379,9 @@ class SnippingOverlay(QWidget):
                 'screen': screen
             })
             
-            # Pro posun fyzického offsetu používáme fyzickou šířku (width * DPR if using logical, but pix.width() is raw)
-            # pix.width() vrací logickou šířku pokud je nastaveno DPR!
-            # Musíme získat raw velikost
+            # For physical offset shift use physical width (width * DPR if using logical, but pix.width() is raw)
+            # pix.width() returns logical width if DPR is set!
+            # Must get raw size
             raw_width = int(pix.width() * pix.devicePixelRatio())
             current_phys_x += raw_width
             
@@ -1504,11 +1504,11 @@ class SnippingOverlay(QWidget):
         self.capture_taken.emit(result)
         
     def show_fullscreen_custom(self):
-        # Místo klasického showFullScreen(), který často bere jen primární monitor,
-        # manuálně nastavíme geometrii přes všechny monitory.
+        # Instead of classic showFullScreen(), which often takes only primary monitor,
+        # manually set geometry across all monitors.
         self.setGeometry(self.total_rect)
         self.show()
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay zobrazen s geometrií: {self.geometry()}")
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay shown with geometry: {self.geometry()}")
         self.raise_()
         self.activateWindow()
         self.setFocus()
@@ -1582,7 +1582,7 @@ class TrayApp:
         # Apply appearance theme early
         apply_theme_mode(self.settings.value(SETTINGS_THEME_MODE, "system"))
 
-        # Signál pro komunikaci mezi threadem klávesnice a GUI threadem
+        # Signal for communication between keyboard thread and GUI thread
         self.signal_handler = HotkeySignal()
         self.signal_handler.hotkey_pressed.connect(self.on_hotkey_main_thread)
 
@@ -1641,41 +1641,41 @@ class TrayApp:
             pass
 
     def on_hotkey_pressed(self):
-        # Callback z keyboard knihovny běží v jiném vlákně
-        # Musíme emitovat signál pro GUI vlákno
+        # Keyboard library callback runs in another thread
+        # Must emit signal for GUI thread
         self.signal_handler.hotkey_pressed.emit()
 
     def on_hotkey_main_thread(self):
-        # Toggle overlay: pokud běží, zavřít; jinak otevřít
+        # Toggle overlay: if running, close; else open
         
-        # Kontrola stávající instance
+        # Check existing instance
         if self.snipping_overlay:
             try:
                 # Zkusíme zjistit, zda je okno viditelné
                 # Pokud bylo C++ objektem smazáno, vyhodí toto RuntimeError
                 if self.snipping_overlay.isVisible():
-                    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay zavřen")
+                    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay closed")
                     self.snipping_overlay.close()
                     return
             except RuntimeError:
                 # Objekt byl smazán, ale reference zůstala. Vyčistíme.
                 self.snipping_overlay = None
 
-        # Vytvořit a zobrazit nový overlay pro výběr oblasti
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay zapnut")
+        # Create and show new overlay for selection
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay enabled")
         self.snipping_overlay = SnippingOverlay()
-        # Vyčistit referenci po zavření
+        # Clear reference after closing
         try:
             self.snipping_overlay.destroyed.connect(self._overlay_destroyed)
             self.snipping_overlay.capture_taken.connect(self.open_editor)
         except Exception:
             pass
         self.snipping_overlay.show_fullscreen_custom()
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay zobrazen")
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay shown")
 
     def open_editor(self, pixmap: QPixmap):
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Otevírám editor")
-        # Pokud už editor existuje, zavřeme ho nebo aktualizujeme
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Opening editor")
+        # If editor already exists, close or update it
         if self.editor_window:
             self.editor_window.close()
             
@@ -1683,7 +1683,7 @@ class TrayApp:
         self.editor_window.show()
 
     def _overlay_destroyed(self, obj=None):
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay zničen")
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay destroyed")
         if self.snipping_overlay is obj:
             self.snipping_overlay = None
         elif self.snipping_overlay and obj is None:
