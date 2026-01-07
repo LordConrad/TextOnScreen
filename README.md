@@ -1,20 +1,20 @@
 # TxtOnScrn
 
-**TxtOnScrn** je specializovaná desktopová aplikace navržená pro efektivní extrakci a zpracování textu z obrazovky. Nástroj slouží k okamžitému převodu vizuálního obsahu na editovatelný text pomocí OCR a jeho následné analýze pomocí umělé inteligence.
+**TxtOnScrn** is a specialized desktop application designed for efficient text extraction and processing from the screen. This tool instantly converts visual content into editable text using OCR and allows for subsequent analysis using artificial intelligence.
 
-Projekt byl vyvinut v úzké spolupráci s **Google Copilot**.
+The vast majority of the work on this project was performed by **Google Copilot**.
 
-## Účel a využití
-Jedná se o formální a, slovy autora, **"quite useful"** řešení pro uživatele, kteří potřebují rychle digitalizovat text z obrázků, prezentací nebo chybových hlášek a dále s ním pracovat. Aplikace běží na pozadí v systémové liště (System Tray) a je kdykoliv připravena k použití pomocí globální klávesové zkratky.
+## Purpose and Usage
+This is a formal and, in the words of the author, a **"quite useful"** solution for users who need to quickly digitize text from images, presentations, or error messages and work with it further. The application runs in the background in the System Tray and is ready for use at any time via a global keyboard shortcut.
 
-## Klíčové funkce
-*   **Pokročilé snímání obrazovky:** Podpora více monitorů s inteligentním overlayem pro výběr oblasti (snipping tool).
-*   **OCR (Optické rozpoznávání znaků):** Integrovaný engine Tesseract pro přesný převod obrázků na text (podpora češtiny a angličtiny).
-*   **AI Asistent (Public):** Plná integrace cloudu (Google Gemini) pro sumarizaci textu, opravy chyb nebo generování odpovědí přímo v editoru.
-*   **Textový Editor:** Vestavěné rozhraní pro úpravu extrahovaného textu s náhledem původního snímku.
-*   **Zabezpečení:** Šifrování API klíčů pomocí Windows DPAPI.
-*   **Přizpůsobení:** Podpora tmavého/světlého režimu (včetně systémového nastavení) a konfigurovatelné klávesové zkratky.
+## Key Features
+*   **Advanced Screen Capture:** Multi-monitor support with an intelligent overlay for area selection (snipping tool).
+*   **OCR (Optical Character Recognition):** Integrated Tesseract engine for accurate conversion of images to text (supports Czech and English).
+*   **AI Assistant (Public):** Full cloud integration (Google Gemini) for text summarization, error correction, or generating responses directly within the editor.
+*   **Text Editor:** Built-in interface for editing extracted text with a preview of the original snapshot.
+*   **Security:** API key encryption using Windows DPAPI.
+*   **Customization:** Support for dark/light mode (including system settings) and configurable hotkeys.
 
-## Známá omezení a plánovaný vývoj
-Ačkoliv je jádro aplikace plně funkční, následující funkce jsou momentálně ve fázi implementace:
-*   **Lokální AI integrace:** V nastavení jsou již připraveny volby pro lokální LLM (Ollama, LM Studio, LocalAI), avšak "Local Assistant" zatím provádí pouze základní hardwarově nenáročné operace (např. jednoduché formátování) a není prozatím napojen na API lokálních serverů.
+## Known Limitations and Planned Development
+Although the core of the application is fully functional, the following features are currently in the implementation phase:
+*   **Local AI Integration:** Options for local LLMs (Ollama, LM Studio, LocalAI) are already prepared in the settings, but the "Local Assistant" currently performs only basic hardware-light operations (e.g., simple formatting) and is not yet connected to the APIs of local servers.
