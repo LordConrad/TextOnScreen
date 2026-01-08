@@ -6,6 +6,7 @@ import traceback
 import base64
 import ctypes
 import json
+import io
 import urllib.request
 import urllib.error
 import re
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMenuBar,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -48,9 +50,109 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import Qt, QSettings, QSharedMemory, QRect, QPoint, QObject, Signal, QEvent, QUrl
+from PySide6.QtCore import Qt, QSettings, QSharedMemory, QRect, QPoint, QObject, Signal, QEvent, QUrl, QThread, QBuffer
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPainter, QColor, QPen, QCursor, QPixmap, QPalette, QDesktopServices
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
+
+class _OcrWorker(QObject):
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._reader = None
+
+    def run(self, payload) -> None:
+        try:
+            image_path = None
+            png_bytes = None
+            use_greedy = False
+
+            if isinstance(payload, dict):
+                image_path = payload.get("image_path")
+                png_bytes = payload.get("png_bytes")
+                use_greedy = bool(payload.get("use_greedy", False))
+            else:
+                image_path = str(payload)
+
+            # EasyOCR prints a download progress bar on first run.
+            # On some Windows setups stdout is cp1250 and can't encode block characters (\u2588).
+            try:
+                if hasattr(sys.stdout, "reconfigure"):
+                    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+                if hasattr(sys.stderr, "reconfigure"):
+                    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+            np = importlib.import_module("numpy")
+            pil_image = importlib.import_module("PIL.Image")
+            easyocr = importlib.import_module("easyocr")
+
+            # Lazy-init and cache the reader within this worker thread (heavy)
+            if self._reader is None:
+                model_dir = os.path.join(tempfile.gettempdir(), "TxtOnScrn_EasyOCR")
+                os.makedirs(model_dir, exist_ok=True)
+                self._reader = easyocr.Reader(
+                    ["cs", "en"],
+                    gpu=False,
+                    model_storage_directory=model_dir,
+                    verbose=False,
+                )
+
+            if png_bytes is not None:
+                img = pil_image.open(io.BytesIO(png_bytes))
+            else:
+                if not image_path:
+                    raise RuntimeError("Missing image input")
+                img = pil_image.open(image_path)
+            # Mild upscale helps small UI fonts
+            scale = 2
+            img = img.resize((img.size[0] * scale, img.size[1] * scale))
+            img = img.convert("RGB")
+            img_arr = np.array(img)
+
+            if use_greedy:
+                parts = self._reader.readtext(img_arr, detail=0, paragraph=True, decoder="greedy")
+            else:
+                parts = self._reader.readtext(img_arr, detail=0, paragraph=True)
+            out_text = "\n".join([p.strip() for p in parts if isinstance(p, str) and p.strip()]).strip()
+            self.finished.emit(out_text)
+        except ImportError:
+            self.error.emit("OCR Libraries Missing: python library 'easyocr' is missing. Please run: pip install easyocr")
+        except Exception as e:
+            self.error.emit(f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}")
+
+
+class _EnhanceWorker(QObject):
+    finished = Signal(bytes)
+    error = Signal(str)
+
+    def run(self, image_path: str) -> None:
+        try:
+            pil_image = importlib.import_module("PIL.Image")
+            pil_ops = importlib.import_module("PIL.ImageOps")
+            pil_enhance = importlib.import_module("PIL.ImageEnhance")
+            pil_filter = importlib.import_module("PIL.ImageFilter")
+
+            img = pil_image.open(image_path)
+            img = img.convert("RGB")
+
+            # Simple "enhance" pipeline (offline): upscale + autocontrast + mild sharpen
+            scale = 2
+            img = img.resize((img.size[0] * scale, img.size[1] * scale), resample=pil_image.LANCZOS)
+            img = pil_ops.autocontrast(img)
+            img = pil_enhance.Contrast(img).enhance(1.15)
+            img = img.filter(pil_filter.UnsharpMask(radius=2, percent=160, threshold=3))
+
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            self.finished.emit(buf.getvalue())
+        except ImportError:
+            self.error.emit("Enhance tool needs Pillow (PIL). Please run: pip install pillow")
+        except Exception as e:
+            self.error.emit(f"Enhance Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}")
 
 
 ORG_NAME = "TxtOnScrn"
@@ -67,21 +169,15 @@ SETTINGS_AI_OLLAMA_ENABLED = "ai_provider_ollama_enabled"
 SETTINGS_AI_LMSTUDIO_ENABLED = "ai_provider_lmstudio_enabled"
 SETTINGS_AI_LOCALAI_ENABLED = "ai_provider_localai_enabled"
 
-SETTINGS_AI_PUBLIC_GEMINI_ENABLED = "ai_provider_public_gemini_enabled"
-SETTINGS_AI_PUBLIC_HUGGINGFACE_ENABLED = "ai_provider_public_huggingface_enabled"
+SETTINGS_ASSISTANT_SELECTED = "assistant_selected"  # e.g. "local" or "public:groq"
+
+SETTINGS_OCR_USE_GREEDY = "ocr_use_greedy"  # faster, slightly less accurate
+SETTINGS_OCR_IN_MEMORY = "ocr_in_memory"  # avoid temp file I/O
+
 SETTINGS_AI_PUBLIC_GROQ_ENABLED = "ai_provider_public_groq_enabled"
-# (záměrně jen 3 položky v Public)
+# (záměrně jen 2 položky v Public)
 
-SETTINGS_AI_PUBLIC_GEMINI_API_KEY = "ai_public_gemini_api_key"
-SETTINGS_AI_PUBLIC_HUGGINGFACE_API_KEY = "ai_public_huggingface_api_key"
 SETTINGS_AI_PUBLIC_GROQ_API_KEY = "ai_public_groq_api_key"
-
-# Backward-compat (older versions)
-SETTINGS_AI_GEMINI_API_KEY = "ai_gemini_api_key"
-
-# Backward-compat keys (older versions)
-SETTINGS_AI_GEMINI_ENABLED = "ai_provider_gemini_enabled"
-SETTINGS_AI_HUGGINGFACE_ENABLED = "ai_provider_huggingface_enabled"
 SETTINGS_AI_GROQ_ENABLED = "ai_provider_groq_enabled"
 
 DEFAULT_SNIP_BORDER_COLOR = "#aaaaff"
@@ -300,9 +396,19 @@ class ConfigTab(QWidget):
         hotkey_row.addWidget(self.hotkey_label, 1)
         hotkey_row.addWidget(self.change_button)
 
+        ocr_group = QGroupBox("OCR")
+        ocr_layout = QVBoxLayout(ocr_group)
+        self.ocr_greedy_cb = QCheckBox("Fast mode (greedy decoder)")
+        self.ocr_in_memory_cb = QCheckBox("Use in-memory image (avoid temp file)")
+        self.ocr_greedy_cb.toggled.connect(lambda checked: self.settings.setValue(SETTINGS_OCR_USE_GREEDY, bool(checked)))
+        self.ocr_in_memory_cb.toggled.connect(lambda checked: self.settings.setValue(SETTINGS_OCR_IN_MEMORY, bool(checked)))
+        ocr_layout.addWidget(self.ocr_greedy_cb)
+        ocr_layout.addWidget(self.ocr_in_memory_cb)
+
         layout = QVBoxLayout(self)
         layout.addWidget(self.startup_checkbox)
         layout.addLayout(hotkey_row)
+        layout.addWidget(ocr_group)
         layout.addStretch()
 
         self.refresh()
@@ -315,6 +421,14 @@ class ConfigTab(QWidget):
 
         hotkey = self.settings.value(SETTINGS_HOTKEY, DEFAULT_HOTKEY)
         self.hotkey_label.setText(hotkey)
+
+        self.ocr_greedy_cb.blockSignals(True)
+        self.ocr_greedy_cb.setChecked(bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, False, type=bool)))
+        self.ocr_greedy_cb.blockSignals(False)
+
+        self.ocr_in_memory_cb.blockSignals(True)
+        self.ocr_in_memory_cb.setChecked(bool(self.settings.value(SETTINGS_OCR_IN_MEMORY, False, type=bool)))
+        self.ocr_in_memory_cb.blockSignals(False)
 
     def on_startup_toggled(self, checked: bool) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Startup toggled: {checked}")
@@ -404,16 +518,10 @@ class SettingsDialog(QDialog):
 
         public_group = QGroupBox("Public")
         public_layout = QVBoxLayout(public_group)
-        self.ai_pub_gemini_cb = QCheckBox("Google Gemini")
-        self.ai_pub_hf_cb = QCheckBox("Hugging Face")
         self.ai_pub_groq_cb = QCheckBox("Groq")
 
-        self.ai_pub_gemini_cb.toggled.connect(lambda checked: self.on_public_provider_toggled(self.ai_pub_gemini_cb, SETTINGS_AI_PUBLIC_GEMINI_ENABLED, checked))
-        self.ai_pub_hf_cb.toggled.connect(lambda checked: self.on_public_provider_toggled(self.ai_pub_hf_cb, SETTINGS_AI_PUBLIC_HUGGINGFACE_ENABLED, checked))
         self.ai_pub_groq_cb.toggled.connect(lambda checked: self.on_public_provider_toggled(self.ai_pub_groq_cb, SETTINGS_AI_PUBLIC_GROQ_ENABLED, checked))
 
-        public_layout.addWidget(self.ai_pub_gemini_cb)
-        public_layout.addWidget(self.ai_pub_hf_cb)
         public_layout.addWidget(self.ai_pub_groq_cb)
 
         public_key_row = QHBoxLayout()
@@ -439,10 +547,6 @@ class SettingsDialog(QDialog):
 
         public_buttons = QHBoxLayout()
         public_buttons.addStretch()
-        self.ai_login_btn = QPushButton("Log in")
-        self.ai_login_btn.clicked.connect(self.on_ai_login_clicked)
-        public_buttons.addWidget(self.ai_login_btn)
-
         self.ai_get_key_btn = QPushButton("Get API Key")
         self.ai_get_key_btn.clicked.connect(self.on_ai_get_key_clicked)
         public_buttons.addWidget(self.ai_get_key_btn)
@@ -507,45 +611,14 @@ class SettingsDialog(QDialog):
             self.ai_localai_cb.blockSignals(False)
 
         # Backward-compat: older keys map to Public providers
-        if self.settings.value(SETTINGS_AI_PUBLIC_GEMINI_ENABLED, None) is None:
-            self.settings.setValue(SETTINGS_AI_PUBLIC_GEMINI_ENABLED, bool(self.settings.value(SETTINGS_AI_GEMINI_ENABLED, False, type=bool)))
-        if self.settings.value(SETTINGS_AI_PUBLIC_HUGGINGFACE_ENABLED, None) is None:
-            self.settings.setValue(SETTINGS_AI_PUBLIC_HUGGINGFACE_ENABLED, bool(self.settings.value(SETTINGS_AI_HUGGINGFACE_ENABLED, False, type=bool)))
         if self.settings.value(SETTINGS_AI_PUBLIC_GROQ_ENABLED, None) is None:
             self.settings.setValue(SETTINGS_AI_PUBLIC_GROQ_ENABLED, bool(self.settings.value(SETTINGS_AI_GROQ_ENABLED, False, type=bool)))
-
-        if hasattr(self, "ai_pub_gemini_cb"):
-            self.ai_pub_gemini_cb.blockSignals(True)
-            self.ai_pub_gemini_cb.setChecked(bool(self.settings.value(SETTINGS_AI_PUBLIC_GEMINI_ENABLED, False, type=bool)))
-            self.ai_pub_gemini_cb.blockSignals(False)
-        if hasattr(self, "ai_pub_hf_cb"):
-            self.ai_pub_hf_cb.blockSignals(True)
-            self.ai_pub_hf_cb.setChecked(bool(self.settings.value(SETTINGS_AI_PUBLIC_HUGGINGFACE_ENABLED, False, type=bool)))
-            self.ai_pub_hf_cb.blockSignals(False)
         if hasattr(self, "ai_pub_groq_cb"):
             self.ai_pub_groq_cb.blockSignals(True)
             self.ai_pub_groq_cb.setChecked(bool(self.settings.value(SETTINGS_AI_PUBLIC_GROQ_ENABLED, False, type=bool)))
             self.ai_pub_groq_cb.blockSignals(False)
 
-        # Migrate old Gemini key (plain) -> provider-specific key storage
-        legacy_gemini = str(self.settings.value(SETTINGS_AI_GEMINI_API_KEY, "") or "")
-        if legacy_gemini and not str(self.settings.value(SETTINGS_AI_PUBLIC_GEMINI_API_KEY, "") or ""):
-            self.settings.setValue(SETTINGS_AI_PUBLIC_GEMINI_API_KEY, _dpapi_encrypt_to_b64(legacy_gemini))
-
         self._refresh_public_key_ui()
-
-    def on_ai_login_clicked(self) -> None:
-        provider = self._get_selected_public_provider()
-        if not provider:
-            QMessageBox.information(self, "Login", "Select a provider in the Public section.")
-            return
-
-        url = {
-            "gemini": "https://accounts.google.com/",
-            "huggingface": "https://huggingface.co/login",
-            "groq": "https://console.groq.com/",
-        }[provider]
-        QDesktopServices.openUrl(QUrl(url))
 
     def on_ai_get_key_clicked(self) -> None:
         provider = self._get_selected_public_provider()
@@ -554,8 +627,6 @@ class SettingsDialog(QDialog):
             return
 
         url = {
-            "gemini": "https://aistudio.google.com/app/apikey",
-            "huggingface": "https://huggingface.co/settings/tokens",
             "groq": "https://console.groq.com/keys",
         }[provider]
         QDesktopServices.openUrl(QUrl(url))
@@ -594,8 +665,6 @@ class SettingsDialog(QDialog):
             return
 
         key_setting = {
-            "gemini": SETTINGS_AI_PUBLIC_GEMINI_API_KEY,
-            "huggingface": SETTINGS_AI_PUBLIC_HUGGINGFACE_API_KEY,
             "groq": SETTINGS_AI_PUBLIC_GROQ_API_KEY,
         }[provider]
         self.settings.setValue(key_setting, _dpapi_encrypt_to_b64(value))
@@ -619,8 +688,6 @@ class SettingsDialog(QDialog):
     def on_public_provider_toggled(self, checkbox: QCheckBox, setting_key: str, checked: bool) -> None:
         if checked:
             for other_cb, other_key in (
-                (self.ai_pub_gemini_cb, SETTINGS_AI_PUBLIC_GEMINI_ENABLED),
-                (self.ai_pub_hf_cb, SETTINGS_AI_PUBLIC_HUGGINGFACE_ENABLED),
                 (self.ai_pub_groq_cb, SETTINGS_AI_PUBLIC_GROQ_ENABLED),
             ):
                 if other_cb is checkbox:
@@ -634,10 +701,6 @@ class SettingsDialog(QDialog):
         self._refresh_public_key_ui()
 
     def _get_selected_public_provider(self):
-        if self.ai_pub_gemini_cb.isChecked():
-            return "gemini"
-        if self.ai_pub_hf_cb.isChecked():
-            return "huggingface"
         if self.ai_pub_groq_cb.isChecked():
             return "groq"
         return None
@@ -647,13 +710,7 @@ class SettingsDialog(QDialog):
         enabled = provider is not None
 
         # Provider-aware label + placeholder
-        if provider == "gemini":
-            self.public_api_key_label.setText("Gemini API key:")
-            setting_key = SETTINGS_AI_PUBLIC_GEMINI_API_KEY
-        elif provider == "huggingface":
-            self.public_api_key_label.setText("Hugging Face token:")
-            setting_key = SETTINGS_AI_PUBLIC_HUGGINGFACE_API_KEY
-        elif provider == "groq":
+        if provider == "groq":
             self.public_api_key_label.setText("Groq API key:")
             setting_key = SETTINGS_AI_PUBLIC_GROQ_API_KEY
         else:
@@ -663,7 +720,6 @@ class SettingsDialog(QDialog):
         self.public_api_key_edit.setEnabled(enabled)
         self.public_key_show_btn.setEnabled(enabled)
         self.public_key_clear_btn.setEnabled(enabled)
-        self.ai_login_btn.setEnabled(enabled)
         self.ai_get_key_btn.setEnabled(enabled)
         self.ai_test_key_btn.setEnabled(enabled)
 
@@ -692,24 +748,6 @@ class SettingsDialog(QDialog):
 
     def _test_public_key(self, provider: str, api_key: str):
         try:
-            if provider == "gemini":
-                status, body = self._http_json(
-                    f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-                    headers={"Accept": "application/json"},
-                )
-                if status == 200 and isinstance(body, dict) and body.get("models"):
-                    return True, "Gemini key is valid"
-                return False, f"HTTP {status}"
-
-            if provider == "huggingface":
-                status, body = self._http_json(
-                    "https://huggingface.co/api/whoami-v2",
-                    headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
-                )
-                if status == 200 and isinstance(body, dict) and body.get("name"):
-                    return True, f"Logged in as {body.get('name')}"
-                return False, f"HTTP {status}"
-
             if provider == "groq":
                 status, body = self._http_json(
                     "https://api.groq.com/openai/v1/models",
@@ -821,21 +859,42 @@ class HotkeySignal(QObject):
 
 
 class AssistantDialog(QDialog):
-    def __init__(self, mode: str, get_editor_text, parent=None):
+    def __init__(self, mode: str, get_editor_text, set_editor_text=None, open_settings=None, parent=None):
         super().__init__(parent)
         self.mode = (mode or "local").lower()
         self.get_editor_text = get_editor_text
+        self.set_editor_text = set_editor_text
+        self.open_settings = open_settings
 
-        title = "Local Assistant" if self.mode == "local" else "Public Assistant"
-        self.setWindowTitle(title)
+        self.setWindowTitle("Assistant")
         self.setWindowIcon(QIcon(resource_path("ico.ico")))
         self.resize(640, 420)
 
         layout = QVBoxLayout(self)
+
+        # Assistant selection + settings shortcut
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Assistant:"))
+        self.assistant_combo = QComboBox()
+        self.assistant_combo.addItem("Local (offline)", "local")
+        self.assistant_combo.addItem("Public (Groq)", "public:groq")
+        self.assistant_combo.currentIndexChanged.connect(self._on_assistant_changed)
+        top_row.addWidget(self.assistant_combo, 1)
+
+        settings_btn = QPushButton("Settings…")
+        settings_btn.clicked.connect(self._open_settings_clicked)
+        top_row.addWidget(settings_btn)
+
+        help_btn = QPushButton("Help")
+        help_btn.clicked.connect(self._help_clicked)
+        top_row.addWidget(help_btn)
+        layout.addLayout(top_row)
+
         layout.addWidget(QLabel("Enter task/question (can be unrelated to text)."))
 
         self.task_edit = QTextEdit()
         self.task_edit.setPlaceholderText("E.g.: Summarize into 5 points. / Fix typos. / Explain what this means... ")
+        self.task_edit.installEventFilter(self)
         layout.addWidget(self.task_edit, 1)
 
         layout.addWidget(QLabel("Output:"))
@@ -843,11 +902,15 @@ class AssistantDialog(QDialog):
         self.output_edit.setReadOnly(True)
         layout.addWidget(self.output_edit, 2)
 
-        if self.mode == "local":
-            self.output_edit.setPlainText(self._local_help_text())
+        self._set_initial_assistant_selection()
+        self._on_assistant_changed()
 
         buttons = QHBoxLayout()
         buttons.addStretch()
+        apply_btn = QPushButton("Apply to editor")
+        apply_btn.setEnabled(callable(self.set_editor_text))
+        apply_btn.clicked.connect(self._apply_to_editor_clicked)
+        buttons.addWidget(apply_btn)
         run_btn = QPushButton("Run")
         run_btn.clicked.connect(self.on_run)
         buttons.addWidget(run_btn)
@@ -855,6 +918,32 @@ class AssistantDialog(QDialog):
         close_btn.clicked.connect(self.close)
         buttons.addWidget(close_btn)
         layout.addLayout(buttons)
+
+    def eventFilter(self, source, event):
+        # Submit on Enter, allow newline on Shift+Enter
+        if source == self.task_edit and event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                if event.modifiers() & Qt.ShiftModifier:
+                    return False
+                self.on_run()
+                return True
+        return super().eventFilter(source, event)
+
+    def _apply_to_editor_clicked(self) -> None:
+        if not callable(self.set_editor_text):
+            QMessageBox.information(self, "Apply", "Editor is not available.")
+            return
+
+        text = (self.output_edit.toPlainText() or "").strip()
+        if not text:
+            QMessageBox.information(self, "Apply", "No output to apply.")
+            return
+
+        try:
+            self.set_editor_text(text)
+        except Exception as e:
+            QMessageBox.warning(self, "Apply", f"Could not apply to editor: {e}")
 
     def on_run(self):
         task = (self.task_edit.toPlainText() or "").strip()
@@ -868,8 +957,9 @@ class AssistantDialog(QDialog):
             self.output_edit.setPlainText("Please enter a task/question.")
             return
 
-        if self.mode == "public":
-            self._run_public(task=task, editor_text=editor_text)
+        mode, provider = self._get_selected_assistant()
+        if mode == "public":
+            self._run_public(task=task, editor_text=editor_text, provider_override=provider)
             return
 
         # Local Assistant: simple offline text operations (no external APIs)
@@ -887,6 +977,78 @@ class AssistantDialog(QDialog):
         except Exception as e:
             result = f"Local assistant error: {e}"
         self.output_edit.setPlainText(result)
+
+    def _set_initial_assistant_selection(self) -> None:
+        settings = QSettings(ORG_NAME, APP_NAME)
+
+        # 1) Prefer a persisted selection (survives app restarts)
+        saved = str(settings.value(SETTINGS_ASSISTANT_SELECTED, "") or "").strip()
+        if saved:
+            for i in range(self.assistant_combo.count()):
+                if str(self.assistant_combo.itemData(i) or "") == saved:
+                    self.assistant_combo.setCurrentIndex(i)
+                    return
+
+        # 2) Fallback: If the dialog was opened in public mode, default to the selected public provider.
+        if self.mode == "public":
+            provider = self._get_selected_public_provider(settings) or "groq"
+            target = f"public:{provider}"
+        else:
+            target = "local"
+
+        for i in range(self.assistant_combo.count()):
+            if self.assistant_combo.itemData(i) == target:
+                self.assistant_combo.setCurrentIndex(i)
+                break
+
+    def _get_selected_assistant(self) -> tuple[str, str | None]:
+        data = str(self.assistant_combo.currentData() or "local")
+        if data.startswith("public:"):
+            return "public", data.split(":", 1)[1]
+        return "local", None
+
+    def _on_assistant_changed(self) -> None:
+        mode, provider = self._get_selected_assistant()
+        if mode == "local":
+            self.setWindowTitle("Local Assistant")
+        else:
+            title_provider = (provider or "public").capitalize()
+            self.setWindowTitle(f"Public Assistant ({title_provider})")
+
+        # Persist selection for next app start
+        try:
+            data = str(self.assistant_combo.currentData() or "local")
+            QSettings(ORG_NAME, APP_NAME).setValue(SETTINGS_ASSISTANT_SELECTED, data)
+        except Exception:
+            pass
+
+        # Do not write anything into Output automatically.
+
+    def _help_clicked(self) -> None:
+        mode, provider = self._get_selected_assistant()
+        if mode == "local":
+            self.output_edit.setPlainText(self._local_help_text())
+            return
+        self.output_edit.setPlainText(self._public_help_text(provider))
+
+    @staticmethod
+    def _public_help_text(provider: str | None) -> str:
+        p = (provider or "").strip().lower() or "(auto)"
+        return (
+            "Public Assistant – nápověda:\n"
+            f"- Provider: {p}\n"
+            "- API klíč nastav v Settings → AI → Public\n"
+            "- Doporučeno: Groq\n"
+        )
+
+    def _open_settings_clicked(self) -> None:
+        if callable(self.open_settings):
+            try:
+                self.open_settings()
+            except Exception as e:
+                QMessageBox.warning(self, "Settings", f"Could not open settings: {e}")
+        else:
+            QMessageBox.information(self, "Settings", "Open Settings from the main window menu: Settings → Settings…")
 
     def _run_local(self, task: str, text: str) -> str:
         task_l = (task or "").strip().lower()
@@ -1182,25 +1344,22 @@ class AssistantDialog(QDialog):
             return base + f"\nTask: {task}"
         return base
 
-    def _run_public(self, task: str, editor_text: str) -> None:
+    def _run_public(self, task: str, editor_text: str, provider_override: str | None = None) -> None:
         settings = QSettings(ORG_NAME, APP_NAME)
 
-        provider = self._get_selected_public_provider(settings)
+        provider = (provider_override or "").strip().lower() or self._get_selected_public_provider(settings)
         
         if not provider:
             self.output_edit.setPlainText("No public AI provider selected.")
             return
 
         api_key = ""
-        if provider == "gemini":
-            encrypted = str(settings.value(SETTINGS_AI_PUBLIC_GEMINI_API_KEY, "") or "")
-            api_key = _dpapi_decrypt_from_b64(encrypted).strip()
-        elif provider == "groq":
+        if provider == "groq":
             encrypted = str(settings.value(SETTINGS_AI_PUBLIC_GROQ_API_KEY, "") or "")
             api_key = _dpapi_decrypt_from_b64(encrypted).strip()
-        elif provider == "huggingface":
-            # Placeholder if future support is added, currently might not be fully implemented or tested
-            pass
+        else:
+            self.output_edit.setPlainText("No supported public AI provider selected (Groq only).")
+            return
 
         if not api_key:
             self.output_edit.setPlainText(
@@ -1216,9 +1375,7 @@ class AssistantDialog(QDialog):
         QApplication.processEvents()
         try:
             answer = ""
-            if provider == "gemini":
-                answer = self._gemini_generate(api_key=api_key, prompt=prompt)
-            elif provider == "groq":
+            if provider == "groq":
                 answer = self._groq_generate(api_key=api_key, prompt=prompt)
             else:
                 answer = f"Provider '{provider}' is not fully implemented yet."
@@ -1231,10 +1388,6 @@ class AssistantDialog(QDialog):
             self.setCursor(Qt.ArrowCursor)
 
     def _get_selected_public_provider(self, settings: QSettings):
-        if bool(settings.value(SETTINGS_AI_PUBLIC_GEMINI_ENABLED, False, type=bool)):
-            return "gemini"
-        if bool(settings.value(SETTINGS_AI_PUBLIC_HUGGINGFACE_ENABLED, False, type=bool)):
-            return "huggingface"
         if bool(settings.value(SETTINGS_AI_PUBLIC_GROQ_ENABLED, False, type=bool)):
             return "groq"
         return None
@@ -1250,51 +1403,6 @@ class AssistantDialog(QDialog):
                 f"{text}"
             )
         return f"Task: {task}"
-
-    def _gemini_generate(self, api_key: str, prompt: str) -> str:
-        # Model choice: prefer a fast generally-available model name.
-        model = "gemini-1.5-flash"
-        url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={api_key}"
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": prompt}],
-                }
-            ]
-        }
-
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={
-                "Content-Type": "application/json", 
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0"
-            },
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {e.code}: {raw}")
-
-        body = json.loads(raw)
-        candidates = body.get("candidates") or []
-        if not candidates:
-            raise RuntimeError("No candidates in response")
-
-        content = (candidates[0].get("content") or {})
-        parts = content.get("parts") or []
-        text_parts = [p.get("text", "") for p in parts if isinstance(p, dict)]
-        answer = "".join(text_parts).strip()
-        if not answer:
-            raise RuntimeError("Empty response")
-        return answer
 
     def _groq_select_model(self, api_key: str) -> str:
         # Prefer a stable, commonly-available chat model. If Groq changes model names,
@@ -1403,6 +1511,9 @@ class AssistantDialog(QDialog):
 
 
 class EditorWindow(QWidget):
+    ocr_request = Signal(object)
+    enhance_request = Signal(str)
+
     def __init__(self, pixmap: QPixmap, tray_app=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Editor")
@@ -1425,9 +1536,12 @@ class EditorWindow(QWidget):
         save_action.triggered.connect(self.save_image)
         file_menu.addAction(save_action)
         
-        # Copy
-        copy_action = QAction("Copy", self)
-        copy_action.setShortcut(QKeySequence.Copy)
+        save_txt_action = QAction("Save as TXT", self)
+        save_txt_action.triggered.connect(self.save_text_as_txt)
+        file_menu.addAction(save_txt_action)
+
+        # Copy image (no Ctrl+C, that belongs to text)
+        copy_action = QAction("Copy image", self)
         copy_action.triggered.connect(self.copy_to_clipboard)
         file_menu.addAction(copy_action)
         
@@ -1440,6 +1554,28 @@ class EditorWindow(QWidget):
 
         # Tools Menu
         tools_menu = menu_bar.addMenu("Tools")
+
+        # Edit Menu
+        edit_menu = menu_bar.addMenu("Edit")
+
+        copy_text_action = QAction("Copy", self)
+        copy_text_action.setShortcut(QKeySequence.Copy)
+        copy_text_action.triggered.connect(lambda: self.text_edit.copy())
+        edit_menu.addAction(copy_text_action)
+
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence.Undo)  # Ctrl+Z
+        undo_action.triggered.connect(lambda: self.text_edit.undo())
+        edit_menu.addAction(undo_action)
+
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut(QKeySequence.Redo)  # Ctrl+Y
+        redo_action.triggered.connect(lambda: self.text_edit.redo())
+        edit_menu.addAction(redo_action)
+
+        clear_action = QAction("Clear", self)
+        clear_action.triggered.connect(self.clear_text_confirm)
+        edit_menu.addAction(clear_action)
 
         # AI Tools Menu
         ai_menu = menu_bar.addMenu("AI Tools")
@@ -1455,23 +1591,13 @@ class EditorWindow(QWidget):
         ocr_action.triggered.connect(self.run_ocr)
         tools_menu.addAction(ocr_action)
 
-        local_assistant_action = QAction("Local Assistant...", self)
-        local_assistant_action.triggered.connect(self.open_local_assistant)
-        ai_menu.addAction(local_assistant_action)
+        assistant_action = QAction("Assistant...", self)
+        assistant_action.triggered.connect(self.open_assistant)
+        ai_menu.addAction(assistant_action)
 
-        local_assistant_help_action = QAction("Local Assistant Help", self)
-        local_assistant_help_action.triggered.connect(
-            lambda: QMessageBox.information(
-                self,
-                "Local Assistant Help",
-                AssistantDialog._local_help_text(),
-            )
-        )
-        ai_menu.addAction(local_assistant_help_action)
-
-        public_assistant_action = QAction("Public Assistant...", self)
-        public_assistant_action.triggered.connect(self.open_public_assistant)
-        ai_menu.addAction(public_assistant_action)
+        enhance_action = QAction("Enhance image...", self)
+        enhance_action.triggered.connect(self.enhance_image)
+        tools_menu.addAction(enhance_action)
         
         layout.setMenuBar(menu_bar)
         
@@ -1486,6 +1612,8 @@ class EditorWindow(QWidget):
         
         self.text_edit = QTextEdit()
         self.text_edit.setPlaceholderText("Notes...")
+        # Explicitly bind undo/redo shortcuts (QTextEdit usually has them, but keep consistent)
+        self.text_edit.setUndoRedoEnabled(True)
         
         self.splitter.addWidget(self.image_label)
         self.splitter.addWidget(self.text_edit)
@@ -1502,8 +1630,31 @@ class EditorWindow(QWidget):
         # Install event filter to handle image resizing when splitter moves
         self.image_label.installEventFilter(self)
 
-        self._local_assistant_dialog = None
-        self._public_assistant_dialog = None
+        self._assistant_dialog = None
+
+        # OCR worker thread (keeps EasyOCR reader cached in a single thread)
+        self._ocr_thread = QThread(self)
+        self._ocr_worker = _OcrWorker()
+        self._ocr_worker.moveToThread(self._ocr_thread)
+        self.ocr_request.connect(self._ocr_worker.run)
+        self._ocr_worker.finished.connect(self._on_ocr_finished)
+        self._ocr_worker.error.connect(self._on_ocr_error)
+        self._ocr_thread.start()
+
+        self._ocr_progress = None
+        self._ocr_temp_path = None
+
+        # Enhance worker thread
+        self._enhance_thread = QThread(self)
+        self._enhance_worker = _EnhanceWorker()
+        self._enhance_worker.moveToThread(self._enhance_thread)
+        self.enhance_request.connect(self._enhance_worker.run)
+        self._enhance_worker.finished.connect(self._on_enhance_finished)
+        self._enhance_worker.error.connect(self._on_enhance_error)
+        self._enhance_thread.start()
+
+        self._enhance_progress = None
+        self._enhance_temp_path = None
 
     def open_settings(self):
         if self.tray_app and hasattr(self.tray_app, "show_settings"):
@@ -1537,6 +1688,19 @@ class EditorWindow(QWidget):
     def closeEvent(self, event):
         # Save splitter state
         self.settings.setValue("editor_splitter_state", self.splitter.saveState())
+        try:
+            if hasattr(self, "_ocr_thread") and self._ocr_thread and self._ocr_thread.isRunning():
+                self._ocr_thread.quit()
+                self._ocr_thread.wait(1500)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "_enhance_thread") and self._enhance_thread and self._enhance_thread.isRunning():
+                self._enhance_thread.quit()
+                self._enhance_thread.wait(1500)
+        except Exception:
+            pass
         super().closeEvent(event)
 
     def save_image(self):
@@ -1552,112 +1716,215 @@ class EditorWindow(QWidget):
     def _get_editor_text_for_assistant(self) -> str:
         return self.text_edit.toPlainText()
 
-    def open_local_assistant(self):
-        if not self._local_assistant_dialog:
-            self._local_assistant_dialog = AssistantDialog(
+    def _set_editor_text_for_assistant(self, text: str) -> None:
+        self.text_edit.setPlainText(text)
+
+    def open_assistant(self):
+        if not self._assistant_dialog:
+            # Single dialog that can switch between Local/Public via the dropdown.
+            self._assistant_dialog = AssistantDialog(
                 mode="local",
                 get_editor_text=self._get_editor_text_for_assistant,
+                set_editor_text=self._set_editor_text_for_assistant,
+                open_settings=self.open_settings,
                 parent=self,
             )
-        self._local_assistant_dialog.show()
-        self._local_assistant_dialog.raise_()
-        self._local_assistant_dialog.activateWindow()
-
-    def open_public_assistant(self):
-        if not self._public_assistant_dialog:
-            self._public_assistant_dialog = AssistantDialog(
-                mode="public",
-                get_editor_text=self._get_editor_text_for_assistant,
-                parent=self,
-            )
-        self._public_assistant_dialog.show()
-        self._public_assistant_dialog.raise_()
-        self._public_assistant_dialog.activateWindow()
+        self._assistant_dialog.show()
+        self._assistant_dialog.raise_()
+        self._assistant_dialog.activateWindow()
 
     def run_ocr(self):
+        if self._ocr_progress is not None:
+            return
+
         self.setCursor(Qt.WaitCursor)
         QApplication.processEvents()
 
         temp_path = None
         try:
-            # Save current image to temp file for OCR
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                temp_path = f.name
-            
-            self.original_pixmap.save(temp_path)
-            
-            # Check if file was saved correctly
-            if os.path.getsize(temp_path) == 0:
-                self.text_edit.append("Error: Saved image file is empty.")
-                return
+            use_in_memory = bool(self.settings.value(SETTINGS_OCR_IN_MEMORY, False, type=bool))
+            use_greedy = bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, False, type=bool))
 
-            # --- EasyOCR logic ---
+            payload = {
+                "use_greedy": use_greedy,
+                "image_path": None,
+                "png_bytes": None,
+            }
+
+            if use_in_memory:
+                buf = QBuffer()
+                buf.open(QBuffer.ReadWrite)
+                ok = self.original_pixmap.save(buf, "PNG")
+                if not ok:
+                    self.text_edit.append("Error: Could not encode image.")
+                    return
+                payload["png_bytes"] = bytes(buf.data())
+                buf.close()
+                self._ocr_temp_path = None
+            else:
+                # Save current image to temp file for OCR
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    temp_path = f.name
+
+                self.original_pixmap.save(temp_path)
+                if os.path.getsize(temp_path) == 0:
+                    self.text_edit.append("Error: Saved image file is empty.")
+                    return
+
+                self._ocr_temp_path = temp_path
+                payload["image_path"] = temp_path
+
+            # Progress window (indeterminate)
+            dlg = QProgressDialog("Running OCR…", "", 0, 0, self)
+            dlg.setWindowTitle("OCR")
+            dlg.setWindowModality(Qt.WindowModal)
+            dlg.setCancelButton(None)
+            dlg.setMinimumDuration(0)
+            dlg.show()
+            self._ocr_progress = dlg
+
+            # Kick off OCR in worker thread
+            self.ocr_request.emit(payload)
+        except Exception as e:
+            error_msg = f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            self.text_edit.append(error_msg)
+            print(error_msg)
+            self._cleanup_ocr_ui_and_temp()
+
+    def _cleanup_ocr_ui_and_temp(self) -> None:
+        try:
+            if self._ocr_progress is not None:
+                self._ocr_progress.close()
+        except Exception:
+            pass
+        self._ocr_progress = None
+        self.setCursor(Qt.ArrowCursor)
+
+        temp_path = getattr(self, "_ocr_temp_path", None)
+        self._ocr_temp_path = None
+        if temp_path and os.path.exists(temp_path):
             try:
-                # EasyOCR prints a download progress bar on first run.
-                # On some Windows setups stdout is cp1250 and can't encode block characters (\u2588).
-                try:
-                    if hasattr(sys.stdout, "reconfigure"):
-                        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-                    if hasattr(sys.stderr, "reconfigure"):
-                        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-                except Exception:
-                    pass
+                os.remove(temp_path)
+            except Exception:
+                pass
 
-                np = importlib.import_module("numpy")
-                pil_image = importlib.import_module("PIL.Image")
-                easyocr = importlib.import_module("easyocr")
-            except ImportError:
-                QMessageBox.warning(
-                    self,
-                    "OCR Libraries Missing",
-                    "Python library 'easyocr' is missing.\nPlease run: pip install easyocr",
-                )
-                return
-
-            # Lazy-init and cache the reader (heavy)
-            if not hasattr(self, "_easyocr_reader") or self._easyocr_reader is None:
-                model_dir = os.path.join(tempfile.gettempdir(), "TxtOnScrn_EasyOCR")
-                os.makedirs(model_dir, exist_ok=True)
-                # cs = Czech, en = English
-                self._easyocr_reader = easyocr.Reader(
-                    ["cs", "en"],
-                    gpu=False,
-                    model_storage_directory=model_dir,
-                    verbose=False,
-                )
-
-            img = pil_image.open(temp_path)
-            # Mild upscale helps small UI fonts
-            scale = 2
-            img = img.resize((img.size[0] * scale, img.size[1] * scale))
-            img = img.convert("RGB")
-            img_arr = np.array(img)
-
-            parts = self._easyocr_reader.readtext(img_arr, detail=0, paragraph=True)
-            out_text = "\n".join([p.strip() for p in parts if isinstance(p, str) and p.strip()]).strip()
-
+    def _on_ocr_finished(self, out_text: str) -> None:
+        try:
             if out_text:
                 self.text_edit.append(out_text)
             else:
                 self.text_edit.append("No text detected.")
-
-        except Exception as e:
-            # Print full error for debugging
-            error_msg = f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            self.text_edit.append(error_msg)
-            print(error_msg) # Also print to console
-            
         finally:
-            self.setCursor(Qt.ArrowCursor)
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
+            self._cleanup_ocr_ui_and_temp()
+
+    def _on_ocr_error(self, message: str) -> None:
+        try:
+            # Keep current behavior: append detailed error
+            self.text_edit.append(message)
+            print(message)
+        finally:
+            self._cleanup_ocr_ui_and_temp()
+
+    def enhance_image(self) -> None:
+        if self._enhance_progress is not None:
+            return
+
+        self.setCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                temp_path = f.name
+
+            self.original_pixmap.save(temp_path)
+            if os.path.getsize(temp_path) == 0:
+                QMessageBox.warning(self, "Enhance", "Error: Saved image file is empty.")
+                return
+
+            self._enhance_temp_path = temp_path
+
+            dlg = QProgressDialog("Enhancing image…", "", 0, 0, self)
+            dlg.setWindowTitle("Enhance")
+            dlg.setWindowModality(Qt.WindowModal)
+            dlg.setCancelButton(None)
+            dlg.setMinimumDuration(0)
+            dlg.show()
+            self._enhance_progress = dlg
+
+            self.enhance_request.emit(temp_path)
+        except Exception as e:
+            msg = f"Enhance Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            QMessageBox.warning(self, "Enhance", msg)
+            self._cleanup_enhance_ui_and_temp()
+
+    def _cleanup_enhance_ui_and_temp(self) -> None:
+        try:
+            if self._enhance_progress is not None:
+                self._enhance_progress.close()
+        except Exception:
+            pass
+        self._enhance_progress = None
+        self.setCursor(Qt.ArrowCursor)
+
+        temp_path = getattr(self, "_enhance_temp_path", None)
+        self._enhance_temp_path = None
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+    def _on_enhance_finished(self, png_bytes: bytes) -> None:
+        try:
+            pix = QPixmap()
+            ok = pix.loadFromData(png_bytes, "PNG")
+            if not ok or pix.isNull():
+                QMessageBox.warning(self, "Enhance", "Enhance finished, but image could not be loaded.")
+                return
+
+            self.original_pixmap = pix
+            self.update_image_display()
+        finally:
+            self._cleanup_enhance_ui_and_temp()
+
+    def _on_enhance_error(self, message: str) -> None:
+        try:
+            QMessageBox.warning(self, "Enhance", message)
+            print(message)
+        finally:
+            self._cleanup_enhance_ui_and_temp()
 
     def copy_to_clipboard(self):
         clipboard = QApplication.clipboard()
         clipboard.setPixmap(self.original_pixmap)
+
+    def clear_text_confirm(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Clear",
+            "Opravdu chceš vymazat text v editoru?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            self.text_edit.clear()
+
+    def save_text_as_txt(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save as TXT",
+            os.path.join(os.path.expanduser("~"), "Documents", "text.txt"),
+            "Text files (*.txt);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            text = self.text_edit.toPlainText() or ""
+            with open(path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(text)
+        except Exception as e:
+            QMessageBox.warning(self, "Save as TXT", f"Could not save file: {e}")
 
         
     def showEvent(self, event):

@@ -16,5 +16,5 @@ I created this as a formal and, if I may say so, **"quite useful"** solution for
 
 ## Known Limitations and Planned Development
 Although the core of the application is functional, please note the current status of AI features:
-*   **Public AI Assistant:** **Groq works** (OpenAI-compatible endpoint). **Gemini is currently not working**.
+*   **Public AI Assistant:** **Groq works** (OpenAI-compatible endpoint).
 *   **Local Assistant:** Works **offline** for text operations (summaries, bullets, cleanup, stats, sort/dedupe, keywords, outline, simple replace). It is not connected to local model servers (Ollama, LM Studio, etc.) yet, although the options are visible in settings.
