@@ -1,25 +1,21 @@
 @echo off
 REM Build script for TxtOnScrn
 
+set PYTHON_EXE=python
+if exist "%~dp0.venv\Scripts\python.exe" set PYTHON_EXE="%~dp0.venv\Scripts\python.exe"
+
 echo Building TxtOnScrn...
 echo.
 
 REM Check if pyinstaller is installed
-python -m PyInstaller --version >nul 2>&1
+%PYTHON_EXE% -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
     echo PyInstaller nenalezen. Instaluji...
-    pip install pyinstaller
+    %PYTHON_EXE% -m pip install pyinstaller
 )
 
 REM Build the executable
-python -m PyInstaller ^
-    --name=TxtOnScrn ^
-    --onefile ^
-    --windowed ^
-    --icon=ico.ico ^
-    --add-data "ico.ico;." ^
-    --add-data "Tesseract-OCR;Tesseract-OCR" ^
-    main.py
+%PYTHON_EXE% -m PyInstaller --noconfirm --clean TxtOnScrn.spec
 
 echo.
 echo Build completed!

@@ -1,12 +1,33 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_all
+
+
+def _collect_pkgs(*names):
+    datas = []
+    binaries = []
+    hiddenimports = []
+    for n in names:
+        d, b, h = collect_all(n)
+        datas += d
+        binaries += b
+        hiddenimports += h
+    return datas, binaries, hiddenimports
+
+
+extra_datas, extra_binaries, extra_hiddenimports = _collect_pkgs(
+    "easyocr",
+    "torch",
+    "torchvision",
+)
+
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[('ico.ico', '.'), ('Tesseract-OCR', 'Tesseract-OCR')],
-    hiddenimports=[],
+    binaries=extra_binaries,
+    datas=[('ico.ico', '.')] + extra_datas,
+    hiddenimports=extra_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -26,7 +47,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

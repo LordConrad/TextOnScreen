@@ -9,12 +9,12 @@ I created this as a formal and, if I may say so, **"quite useful"** solution for
 
 ## Key Features
 *   **Advanced Screen Capture:** Multi-monitor support with an intelligent overlay for area selection (snipping tool).
-*   **OCR (Optical Character Recognition):** Integrated Tesseract engine for accurate conversion of images to text (supports Czech and English).
+*   **OCR (Optical Character Recognition):** EasyOCR-based text recognition (supports Czech and English). Note: on first use EasyOCR downloads model files.
 *   **Text Editor:** Built-in interface for editing extracted text with a preview of the original snapshot.
 *   **Security:** API key encryption using Windows DPAPI.
 *   **Customization:** Support for dark/light mode (including system settings) and configurable hotkeys.
 
 ## Known Limitations and Planned Development
 Although the core of the application is functional, please note the current status of AI features:
-*   **Public AI Assistant:** Currently **not functional**. I am working on the full cloud integration (Google Gemini) for text summarization and error correction.
-*   **Local AI Integration:** The "Local Assistant" currently works but performs only **basic hardware-light operations** (e.g., simple formatting) and is not yet connected to the APIs of local servers (Ollama, LM Studio, etc.), although the options are visible in settings.
+*   **Public AI Assistant:** **Groq works** (OpenAI-compatible endpoint). **Gemini is currently not working**.
+*   **Local Assistant:** Works **offline** for text operations (summaries, bullets, cleanup, stats, sort/dedupe, keywords, outline, simple replace). It is not connected to local model servers (Ollama, LM Studio, etc.) yet, although the options are visible in settings.

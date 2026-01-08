@@ -8,6 +8,8 @@ import ctypes
 import json
 import urllib.request
 import urllib.error
+import re
+import importlib
 from pathlib import Path
 from datetime import datetime
 
@@ -18,15 +20,7 @@ os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
 os.environ["QT_SCREEN_SCALE_FACTORS"] = "1"
 os.environ["QT_SCALE_FACTOR"] = "1"
 
-# Try importing Tesseract (Pytesseract)
-try:
-    import pytesseract
-    from PIL import Image
-    HAS_TESSERACT = True
-except ImportError:
-    HAS_TESSERACT = False
-
- 
+# OCR engine is optional and imported lazily (see EditorWindow.run_ocr).
 
 import keyboard
 
@@ -243,40 +237,6 @@ def apply_theme_mode(mode: str) -> None:
 def resource_path(name: str) -> str:
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return str(base_path / name)
-
-
-def setup_tesseract():
-    """Configures the path to the Tesseract OCR binary."""
-    if not HAS_TESSERACT:
-        return False
-        
-    # 1. Try to find bundled Tesseract (for EXE version)
-    # Assume "Tesseract-OCR" folder is bundled in root
-    internal_tess = resource_path(os.path.join("Tesseract-OCR", "tesseract.exe"))
-    if os.path.exists(internal_tess):
-        pytesseract.pytesseract.tesseract_cmd = internal_tess
-        return True
-        
-    # 2. If not bundled (running in VS Code), try next to script
-    local_tess = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Tesseract-OCR", "tesseract.exe")
-    if os.path.exists(local_tess):
-        pytesseract.pytesseract.tesseract_cmd = local_tess
-        return True
-
-    # 3. Fallback: Try system paths
-    possible_paths = [
-        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
-        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe'
-    ]
-    for path in possible_paths:
-        if os.path.exists(path):
-            pytesseract.pytesseract.tesseract_cmd = path
-            return True
-            
-    return False
-
-# Initialize tesseract on startup
-setup_tesseract()
 
 
 def get_startup_command() -> str:
@@ -883,6 +843,9 @@ class AssistantDialog(QDialog):
         self.output_edit.setReadOnly(True)
         layout.addWidget(self.output_edit, 2)
 
+        if self.mode == "local":
+            self.output_edit.setPlainText(self._local_help_text())
+
         buttons = QHBoxLayout()
         buttons.addStretch()
         run_btn = QPushButton("Run")
@@ -919,48 +882,330 @@ class AssistantDialog(QDialog):
             )
             return
 
-        task_l = task.lower()
-        lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
-        if "shrň" in task_l or "shrnout" in task_l or "summary" in task_l or "summarize" in task_l:
-            take = min(5, len(lines))
-            summary = "\n".join(f"- {lines[i][:200]}" for i in range(take))
-            self.output_edit.setPlainText(summary if summary else "(Nothing to summarize.)")
-            return
+        try:
+            result = self._run_local(task=task, text=text)
+        except Exception as e:
+            result = f"Local assistant error: {e}"
+        self.output_edit.setPlainText(result)
 
-        if "odráž" in task_l or "body" in task_l or "bullet" in task_l:
-            take = min(10, len(lines))
-            bullets = "\n".join(f"- {lines[i][:200]}" for i in range(take))
-            self.output_edit.setPlainText(bullets if bullets else "(Nothing to list.)")
-            return
+    def _run_local(self, task: str, text: str) -> str:
+        task_l = (task or "").strip().lower()
 
-        if "vyčisti" in task_l or "očisti" in task_l or "cleanup" in task_l:
+        if task_l in {"help", "?", "napoveda", "nápověda", "co umí", "co umi", "commands"}:
+            return self._local_help_text()
+
+        # Lightweight stopwords for scoring (CS + EN). Not exhaustive; tuned for robustness.
+        stopwords = {
+            # Czech
+            "a", "aby", "ahoj", "aj", "ak", "ale", "ano", "asi", "aspoň", "az", "až",
+            "bez", "bude", "budou", "by", "byl", "byla", "byli", "bylo", "být", "byť",
+            "co", "což", "cz", "dnes", "do", "doc", "docs", "e", "email", "fakt", "hmm",
+            "i", "jak", "jako", "je", "jeho", "jej", "její", "jejich", "jen", "ještě", "jsi", "jsme", "jsou", "jste",
+            "k", "kam", "kde", "kdo", "kdy", "když", "ke", "která", "které", "který", "kteří",
+            "kvůli", "li", "má", "mají", "mezi", "mít", "mně", "může", "můžou", "na", "nad", "ne", "nebo",
+            "nej", "není", "nic", "nový", "nová", "nové", "noví", "o", "od", "on", "ona", "ono", "oni", "oproti",
+            "po", "pod", "podle", "pokud", "proto", "protože", "pro", "před", "přes", "se", "si", "s", "stále",
+            "tak", "taky", "takže", "ten", "tento", "tím", "to", "tohle", "tom", "tomu", "tu", "tuto", "tvůj", "tvoje",
+            "u", "už", "v", "ve", "w", "www", "vy", "vás", "váš", "vaše", "vše", "však", "že",
+            "z", "za", "ze",
+            # English
+            "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could",
+            "did", "do", "does", "done", "for", "from", "had", "has", "have", "he", "her", "here", "him", "his",
+            "how", "i", "if", "in", "into", "is", "it", "its", "just", "may", "me", "more", "most", "my",
+            "no", "not", "of", "on", "or", "our", "out", "she", "so", "than", "that", "the", "their", "them",
+            "then", "there", "these", "they", "this", "to", "too", "up", "us", "was", "we", "were", "what", "when",
+            "where", "which", "who", "will", "with", "you", "your",
+        }
+
+        # Common helpers
+        def _non_empty_lines(src: str) -> list[str]:
+            return [ln.rstrip() for ln in src.splitlines() if ln.strip()]
+
+        def _parse_int_from_task(default: int) -> int:
+            m = re.search(r"\b(\d{1,3})\b", task_l)
+            if not m:
+                return default
+            try:
+                val = int(m.group(1))
+                return val if val > 0 else default
+            except Exception:
+                return default
+
+        def _split_sentences(src: str) -> list[str]:
+            s = re.sub(r"\s+", " ", (src or "").strip())
+            if not s:
+                return []
+            # Split on common sentence terminators. Keep it simple and language-agnostic.
+            parts = re.split(r"(?<=[\.!\?])\s+", s)
+            out = []
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                # Avoid treating short fragments as sentences
+                if len(p) < 20 and not re.search(r"[A-Za-zÀ-ž]", p):
+                    continue
+                out.append(p)
+            return out
+
+        def _tokenize_words(src: str) -> list[str]:
+            return [w.lower() for w in re.findall(r"[A-Za-zÀ-ž0-9]+", src or "")]
+
+        def _extractive_summary(src: str, max_items: int, as_bullets: bool) -> str:
+            sentences = _split_sentences(src)
+            if not sentences:
+                # Fallback to line-based if we can't split sentences.
+                lines2 = _non_empty_lines(src)
+                take = min(max_items, len(lines2))
+                if take <= 0:
+                    return "(Nothing to summarize.)"
+                if as_bullets:
+                    return "\n".join(f"- {lines2[i][:240]}" for i in range(take))
+                return " ".join(lines2[:take])
+
+            words = _tokenize_words(src)
+            freq: dict[str, float] = {}
+            for w in words:
+                if len(w) <= 2:
+                    continue
+                if w in stopwords:
+                    continue
+                freq[w] = freq.get(w, 0.0) + 1.0
+            if not freq:
+                # If everything is stopwords, pick first sentences.
+                take = min(max_items, len(sentences))
+                picked = sentences[:take]
+                return "\n".join(f"- {s}" for s in picked) if as_bullets else " ".join(picked)
+
+            max_f = max(freq.values())
+            for k in list(freq.keys()):
+                freq[k] = freq[k] / max_f
+
+            scored: list[tuple[float, int, str]] = []
+            for idx, sent in enumerate(sentences):
+                toks = _tokenize_words(sent)
+                if not toks:
+                    continue
+                score = 0.0
+                useful = 0
+                for t in toks:
+                    if len(t) <= 2 or t in stopwords:
+                        continue
+                    useful += 1
+                    score += freq.get(t, 0.0)
+                # Normalize and lightly penalize very long sentences
+                if useful > 0:
+                    score = score / useful
+                score = score / (1.0 + max(0, (len(sent) - 220)) / 220.0)
+                # Small boost for sentences that look like key statements
+                if re.search(r"\b(důležité|hlavně|shrnutí|závěr|conclusion|key|important)\b", sent, re.IGNORECASE):
+                    score *= 1.15
+                scored.append((score, idx, sent))
+
+            if not scored:
+                take = min(max_items, len(sentences))
+                picked = sentences[:take]
+            else:
+                take = min(max_items, len(scored))
+                top = sorted(scored, key=lambda x: x[0], reverse=True)[:take]
+                picked = [s for _, _, s in sorted(top, key=lambda x: x[1])]
+
+            if as_bullets:
+                return "\n".join(f"- {s}" for s in picked)
+            return " ".join(picked)
+
+        def _keywords(src: str, max_items: int) -> list[str]:
+            toks = _tokenize_words(src)
+            counts: dict[str, int] = {}
+            for t in toks:
+                if len(t) <= 3:
+                    continue
+                if t in stopwords:
+                    continue
+                counts[t] = counts.get(t, 0) + 1
+            items = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+            return [w for w, _ in items[:max_items]]
+
+        def _outline_from_headings(src: str, max_items: int) -> list[str]:
+            out: list[str] = []
+            for ln in (src or "").splitlines():
+                s = ln.strip()
+                if not s:
+                    continue
+                if s.startswith("#"):
+                    out.append(s.lstrip("#").strip())
+                    continue
+                # Simple heuristic: all-caps or ends with ':'
+                if (len(s) >= 6 and s.upper() == s and re.search(r"[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]", s)) or s.endswith(":"):
+                    out.append(s.rstrip(":"))
+            # Deduplicate while preserving order
+            seen = set()
+            uniq = []
+            for item in out:
+                if item in seen:
+                    continue
+                seen.add(item)
+                uniq.append(item)
+            return uniq[:max_items]
+
+        # 1) Better summarization (extractive)
+        lines = _non_empty_lines(text)
+        if any(k in task_l for k in ["tldr", "tl;dr", "stručně", "strucne", "krátce", "kratce", "short summary"]):
+            take = _parse_int_from_task(3)
+            return _extractive_summary(text, max_items=take, as_bullets=True)
+
+        if any(k in task_l for k in ["shrň", "shrnout", "summary", "summarize", "souhrn", "zhrň", "zhrnout"]):
+            take = _parse_int_from_task(5)
+            as_bullets = True
+            if any(k in task_l for k in ["věty", "vety", "sentences", "odstavec", "paragraph"]):
+                as_bullets = False
+            return _extractive_summary(text, max_items=take, as_bullets=as_bullets)
+
+        if any(k in task_l for k in ["odráž", "odraz", "body", "bullet", "bullets"]):
+            take = _parse_int_from_task(8)
+            return _extractive_summary(text, max_items=take, as_bullets=True)
+
+        # 2) Cleanup / remove empty lines
+        if any(k in task_l for k in ["vyčisti", "očisti", "ocisti", "cleanup", "trim"]):
             cleaned = "\n".join(ln.strip() for ln in text.splitlines())
-            self.output_edit.setPlainText(cleaned)
-            return
+            return cleaned
 
-        self.output_edit.setPlainText(
-            "Local Assistant currently supports only simple offline operations.\n"
-            "Try: 'Summarize', 'Bullet points', 'Cleanup'.\n\n"
-            f"Task: {task}"
+        if any(k in task_l for k in ["odstraň prázd", "odstran prazd", "remove empty", "drop empty"]):
+            return "\n".join(_non_empty_lines(text))
+
+        # 3) Basic stats
+        if any(k in task_l for k in ["stat", "statistics", "počty", "pocty", "counts", "info"]):
+            all_lines = text.splitlines()
+            non_empty = _non_empty_lines(text)
+            words = re.findall(r"\S+", text)
+            return (
+                f"Lines: {len(all_lines)}\n"
+                f"Non-empty lines: {len(non_empty)}\n"
+                f"Words: {len(words)}\n"
+                f"Chars: {len(text)}"
+            )
+
+        # 4) Case conversions
+        if any(k in task_l for k in ["uppercase", "upper", "velk", "velká", "velka"]):
+            return text.upper()
+        if any(k in task_l for k in ["lowercase", "lower", "mal", "malá", "mala"]):
+            return text.lower()
+        if any(k in task_l for k in ["titlecase", "title", "nadpis"]):
+            return text.title()
+
+        # 5) Sort / dedupe lines
+        if any(k in task_l for k in ["seřaď", "serad", "sort"]):
+            reverse = any(k in task_l for k in ["sestup", "desc", "reverse", "obrácen", "obracen"])
+            sorted_lines = sorted(_non_empty_lines(text), key=lambda s: s.lower(), reverse=reverse)
+            return "\n".join(sorted_lines)
+
+        if any(k in task_l for k in ["unikátní", "unikatni", "dedupe", "unique"]):
+            seen = set()
+            out = []
+            for ln in _non_empty_lines(text):
+                key = ln
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(ln)
+            return "\n".join(out)
+
+        # 6) Extract URLs / emails
+        if any(k in task_l for k in ["url", "linky", "links", "odkazy"]):
+            urls = re.findall(r"https?://[^\s\]\)\>\"']+", text)
+            return "\n".join(urls) if urls else "(No URLs found.)"
+
+        if any(k in task_l for k in ["email", "e-mail", "maily", "mail"]):
+            emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+            return "\n".join(emails) if emails else "(No emails found.)"
+
+        # 7) JSON pretty print
+        if "json" in task_l and any(k in task_l for k in ["pretty", "format", "indent", "zformát", "zformat"]):
+            try:
+                obj = json.loads(text)
+            except Exception as e:
+                return f"Invalid JSON: {e}"
+            return json.dumps(obj, ensure_ascii=False, indent=2)
+
+        # 8) Find/replace
+        # a) sed-like: s/old/new/
+        m = re.search(r"\bs/(.*?)/(.*?)/\b", task, flags=re.IGNORECASE)
+        if m:
+            old, new = m.group(1), m.group(2)
+            return text.replace(old, new)
+
+        # b) replace "old" -> "new" or replace old -> new
+        m = re.search(r"\breplace\s+(.+?)\s*(?:->|=>|with)\s*(.+)$", task, flags=re.IGNORECASE)
+        if not m:
+            m = re.search(r"\bnahrad\s+(.+?)\s*(?:->|=>|na)\s*(.+)$", task, flags=re.IGNORECASE)
+        if m:
+            old = m.group(1).strip().strip('"\'')
+            new = m.group(2).strip().strip('"\'')
+            if not old:
+                return "Replace error: missing 'old' value."
+            return text.replace(old, new)
+
+        # 9) Keywords / outline
+        if any(k in task_l for k in ["klíčová slova", "klicova slova", "keywords", "tagy", "tags"]):
+            n = _parse_int_from_task(12)
+            keys = _keywords(text, max_items=n)
+            return "\n".join(f"- {k}" for k in keys) if keys else "(No keywords found.)"
+
+        if any(k in task_l for k in ["osnova", "outline", "obsah", "headings", "nadpis"]):
+            n = _parse_int_from_task(12)
+            items = _outline_from_headings(text, max_items=n)
+            return "\n".join(f"- {it}" for it in items) if items else "(No headings found.)"
+
+
+        return self._local_help_text(task=task)
+
+    @staticmethod
+    def _local_help_text(task: str | None = None) -> str:
+        base = (
+            "Local Assistant (offline) – příkazy:\n"
+            "- Nápověda: 'help' / 'nápověda'\n"
+            "- Shrnutí: 'shrň 5' / 'summarize 5'\n"
+            "- TL;DR: 'TL;DR 3' / 'stručně 3'\n"
+            "- Odrážky: 'odrážky 8' / 'bullet points 8'\n"
+            "- Vyčistit whitespace: 'vyčisti' / 'cleanup'\n"
+            "- Odstranit prázdné řádky: 'remove empty lines'\n"
+            "- Statistiky: 'stats' / 'počty'\n"
+            "- Seřadit řádky: 'seřaď' / 'sort' (+ 'desc')\n"
+            "- Unikátní řádky: 'unikátní' / 'dedupe'\n"
+            "- Najít URL/email: 'url' / 'email'\n"
+            "- Klíčová slova: 'klíčová slova 12' / 'keywords 12'\n"
+            "- Osnova z nadpisů: 'osnova' / 'outline'\n"
+            "- JSON pretty: 'json pretty'\n"
+            "- Nahradit: 'replace A -> B' nebo 's/A/B/'\n"
         )
+        if task:
+            return base + f"\nTask: {task}"
+        return base
 
     def _run_public(self, task: str, editor_text: str) -> None:
         settings = QSettings(ORG_NAME, APP_NAME)
 
         provider = self._get_selected_public_provider(settings)
-        if provider != "gemini":
-            self.output_edit.setPlainText(
-                "Public Assistant is currently connected only to Gemini.\n"
-                "Select in Settings → AI → Public: Google Gemini."
-            )
+        
+        if not provider:
+            self.output_edit.setPlainText("No public AI provider selected.")
             return
 
-        encrypted = str(settings.value(SETTINGS_AI_PUBLIC_GEMINI_API_KEY, "") or "")
-        api_key = _dpapi_decrypt_from_b64(encrypted).strip()
+        api_key = ""
+        if provider == "gemini":
+            encrypted = str(settings.value(SETTINGS_AI_PUBLIC_GEMINI_API_KEY, "") or "")
+            api_key = _dpapi_decrypt_from_b64(encrypted).strip()
+        elif provider == "groq":
+            encrypted = str(settings.value(SETTINGS_AI_PUBLIC_GROQ_API_KEY, "") or "")
+            api_key = _dpapi_decrypt_from_b64(encrypted).strip()
+        elif provider == "huggingface":
+            # Placeholder if future support is added, currently might not be fully implemented or tested
+            pass
+
         if not api_key:
             self.output_edit.setPlainText(
-                "Missing Gemini API key.\n"
-                "Go to Settings → AI → Public, select Google Gemini and enter API key."
+                f"Missing API key for {provider}.\n"
+                "Go to Settings -> AI -> Public and enter the API key."
             )
             return
 
@@ -970,7 +1215,14 @@ class AssistantDialog(QDialog):
         self.task_edit.setEnabled(False)
         QApplication.processEvents()
         try:
-            answer = self._gemini_generate(api_key=api_key, prompt=prompt)
+            answer = ""
+            if provider == "gemini":
+                answer = self._gemini_generate(api_key=api_key, prompt=prompt)
+            elif provider == "groq":
+                answer = self._groq_generate(api_key=api_key, prompt=prompt)
+            else:
+                answer = f"Provider '{provider}' is not fully implemented yet."
+
             self.output_edit.setPlainText(answer)
         except Exception as e:
             self.output_edit.setPlainText(f"Public AI error: {e}")
@@ -1017,7 +1269,11 @@ class AssistantDialog(QDialog):
             url,
             data=data,
             method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers={
+                "Content-Type": "application/json", 
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0"
+            },
         )
 
         try:
@@ -1039,6 +1295,111 @@ class AssistantDialog(QDialog):
         if not answer:
             raise RuntimeError("Empty response")
         return answer
+
+    def _groq_select_model(self, api_key: str) -> str:
+        # Prefer a stable, commonly-available chat model. If Groq changes model names,
+        # we fall back to listing available models and picking the best match.
+        preferences = [
+            "llama-3.1-8b-instant",
+            "llama-3.1-70b-versatile",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it",
+        ]
+
+        url = "https://api.groq.com/openai/v1/models"
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            # If listing fails (network, auth, etc.), use the top preference.
+            return preferences[0]
+
+        try:
+            body = json.loads(raw)
+        except Exception:
+            return preferences[0]
+
+        data = body.get("data") or []
+        ids = [m.get("id") for m in data if isinstance(m, dict) and m.get("id")]
+        for pref in preferences:
+            if pref in ids:
+                return pref
+        return ids[0] if ids else preferences[0]
+
+    def _groq_generate(self, api_key: str, prompt: str) -> str:
+        # Cache the selected model for this dialog instance to avoid extra round-trips.
+        model = getattr(self, "_groq_model", "") or self._groq_select_model(api_key)
+        self._groq_model = model
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.7
+        }
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "Mozilla/5.0"
+            },
+        )
+
+        def _do_request() -> str:
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as e:
+                raw_err = e.read().decode("utf-8", errors="replace")
+                raise urllib.error.HTTPError(e.url, e.code, raw_err, e.hdrs, e.fp)
+
+        try:
+            raw = _do_request()
+        except urllib.error.HTTPError as e:
+            raw_err = str(e)
+            # If the model is deprecated, pick a new model and retry once.
+            try:
+                body_err = json.loads(raw_err)
+                err = (body_err.get("error") or {}) if isinstance(body_err, dict) else {}
+                if err.get("code") == "model_decommissioned":
+                    self._groq_model = self._groq_select_model(api_key)
+                    payload["model"] = self._groq_model
+                    data_retry = json.dumps(payload).encode("utf-8")
+                    req.data = data_retry
+                    raw = _do_request()
+                else:
+                    raise RuntimeError(f"HTTP {e.code}: {raw_err}")
+            except Exception:
+                raise RuntimeError(f"HTTP {e.code}: {raw_err}")
+
+        body = json.loads(raw)
+        choices = body.get("choices") or []
+        if not choices:
+            raise RuntimeError("No choices in response")
+
+        message = choices[0].get("message") or {}
+        content = message.get("content") or ""
+
+        if not content:
+            raise RuntimeError("Empty response content")
+
+        return content
 
 
 class EditorWindow(QWidget):
@@ -1097,6 +1458,16 @@ class EditorWindow(QWidget):
         local_assistant_action = QAction("Local Assistant...", self)
         local_assistant_action.triggered.connect(self.open_local_assistant)
         ai_menu.addAction(local_assistant_action)
+
+        local_assistant_help_action = QAction("Local Assistant Help", self)
+        local_assistant_help_action.triggered.connect(
+            lambda: QMessageBox.information(
+                self,
+                "Local Assistant Help",
+                AssistantDialog._local_help_text(),
+            )
+        )
+        ai_menu.addAction(local_assistant_help_action)
 
         public_assistant_action = QAction("Public Assistant...", self)
         public_assistant_action.triggered.connect(self.open_public_assistant)
@@ -1204,40 +1575,6 @@ class EditorWindow(QWidget):
         self._public_assistant_dialog.activateWindow()
 
     def run_ocr(self):
-        # Re-check imports locally to handle runtime installation
-        global HAS_TESSERACT
-        
-        try:
-            from PIL import Image, ImageEnhance, ImageFilter
-            import pytesseract
-            
-            # If we are here, imports work. Update global state if needed.
-            if not HAS_TESSERACT:
-                HAS_TESSERACT = True
-                setup_tesseract()
-        except ImportError:
-            HAS_TESSERACT = False
-
-        if not HAS_TESSERACT:
-            QMessageBox.warning(
-                self, 
-                "OCR Libraries Missing", 
-                "Python library 'pytesseract' or 'pillow' is missing.\nPlease run: pip install pytesseract pillow"
-            )
-            return
-
-        # Ověření, zda máme funkční cestu k EXE (pokud selže version check, zkusíme znovu setup)
-        try:
-            pytesseract.get_tesseract_version()
-        except:
-            if not setup_tesseract():
-                 QMessageBox.warning(
-                    self,
-                    "Tesseract Engine Missing",
-                    "Could not find Tesseract-OCR executable.\nEnsure the 'Tesseract-OCR' folder is in the application directory."
-                )
-                 return
-
         self.setCursor(Qt.WaitCursor)
         QApplication.processEvents()
 
@@ -1254,39 +1591,53 @@ class EditorWindow(QWidget):
                 self.text_edit.append("Error: Saved image file is empty.")
                 return
 
-            # --- TESSERACT OCR logic ---
-            # Pre-processing pro lepší přesnost
-            img = Image.open(temp_path)
-            
-            # 1. Zvětšení obrázku (Upscaling)
-            # Tesseract očekává cca 300 DPI, ale obrazovka má obvykle 96 DPI.
-            # Zvětšení 3x výrazně zpřesní rozpoznávání malých písmen a diakritiky.
-            new_size = tuple(3 * x for x in img.size)
-            # Použijeme kvalitní resampling (LANCZOS)
-            resample_method = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
-            img = img.resize(new_size, resample_method)
-            
-            # 2. Převod na odstíny šedi (Grayscale)
-            img = img.convert('L')
-            
-            # 3. Zvýšení kontrastu a ostrosti
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(2.0) # Zvýšíme kontrast 2x
-            
-            enhancer = ImageEnhance.Sharpness(img)
-            img = enhancer.enhance(2.0) # Doostříme hrany
-            
-            # 4. Volitelně: Binarizace (černá/bílá) - často pomůže zbavit se šumu pozadí
-            # img = img.point(lambda x: 0 if x < 140 else 255, '1')
+            # --- EasyOCR logic ---
+            try:
+                # EasyOCR prints a download progress bar on first run.
+                # On some Windows setups stdout is cp1250 and can't encode block characters (\u2588).
+                try:
+                    if hasattr(sys.stdout, "reconfigure"):
+                        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+                    if hasattr(sys.stderr, "reconfigure"):
+                        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
 
-            # lang='ces+eng' (čeština + angličtina)
-            # --psm 6 (Assume a single uniform block of text) - ideální pro screenshoty
-            custom_config = r'--psm 6'
-            
-            text = pytesseract.image_to_string(img, lang='ces+eng', config=custom_config)
-            
-            if text and text.strip():
-                self.text_edit.append(text.strip())
+                np = importlib.import_module("numpy")
+                pil_image = importlib.import_module("PIL.Image")
+                easyocr = importlib.import_module("easyocr")
+            except ImportError:
+                QMessageBox.warning(
+                    self,
+                    "OCR Libraries Missing",
+                    "Python library 'easyocr' is missing.\nPlease run: pip install easyocr",
+                )
+                return
+
+            # Lazy-init and cache the reader (heavy)
+            if not hasattr(self, "_easyocr_reader") or self._easyocr_reader is None:
+                model_dir = os.path.join(tempfile.gettempdir(), "TxtOnScrn_EasyOCR")
+                os.makedirs(model_dir, exist_ok=True)
+                # cs = Czech, en = English
+                self._easyocr_reader = easyocr.Reader(
+                    ["cs", "en"],
+                    gpu=False,
+                    model_storage_directory=model_dir,
+                    verbose=False,
+                )
+
+            img = pil_image.open(temp_path)
+            # Mild upscale helps small UI fonts
+            scale = 2
+            img = img.resize((img.size[0] * scale, img.size[1] * scale))
+            img = img.convert("RGB")
+            img_arr = np.array(img)
+
+            parts = self._easyocr_reader.readtext(img_arr, detail=0, paragraph=True)
+            out_text = "\n".join([p.strip() for p in parts if isinstance(p, str) and p.strip()]).strip()
+
+            if out_text:
+                self.text_edit.append(out_text)
             else:
                 self.text_edit.append("No text detected.")
 
