@@ -40,12 +40,13 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    [],
+    [],
     [],
     name='TxtOnScrn',
     debug=False,
     bootloader_ignore_signals=False,
+    exclude_binaries=True,
     strip=False,
     upx=False,
     upx_exclude=[],
@@ -57,4 +58,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['ico.ico'],
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='TxtOnScrn',
 )

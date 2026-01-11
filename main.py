@@ -7,12 +7,238 @@ import base64
 import ctypes
 import json
 import io
+import subprocess
 import urllib.request
 import urllib.error
 import re
+import shutil
 import importlib
 from pathlib import Path
 from datetime import datetime
+
+
+def _get_easyocr_model_dir() -> str:
+    """Return a persistent per-user directory for EasyOCR model files."""
+    # Windows: use LOCALAPPDATA (survives reboot and temp cleanups)
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        model_dir = Path(base) / "TxtOnScrn" / "EasyOCR"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        return str(model_dir)
+
+    # Other OSes / fallback: use XDG cache if available, otherwise ~/.cache
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        model_dir = Path(xdg_cache) / "TxtOnScrn" / "EasyOCR"
+    else:
+        model_dir = Path.home() / ".cache" / "TxtOnScrn" / "EasyOCR"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    return str(model_dir)
+
+
+def _get_app_data_dir() -> str:
+    """Return the persistent per-user app data directory used by TxtOnScrn."""
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return str(Path(base) / "TxtOnScrn")
+
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        return str(Path(xdg_cache) / "TxtOnScrn")
+
+    return str(Path.home() / ".cache" / "TxtOnScrn")
+
+
+def _ocr_worker_main() -> int:
+    """CLI entrypoint used by the GUI process to run OCR in a separate process.
+
+    Reads JSON from stdin and writes JSON to stdout.
+    Input schema:
+      {"image_path": str|null, "png_b64": str|null, "use_greedy": bool}
+    Output schema:
+      {"ok": true, "text": str} OR {"ok": false, "error": str}
+    """
+    try:
+        raw_in = sys.stdin.buffer.read()
+        if not raw_in:
+            raise RuntimeError("Missing stdin payload")
+        payload = json.loads(raw_in.decode("utf-8", errors="replace"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("Invalid payload")
+
+        image_path = payload.get("image_path")
+        png_b64 = payload.get("png_b64")
+        use_greedy = bool(payload.get("use_greedy", False))
+        try:
+            scale = int(payload.get("scale", 2) or 2)
+        except Exception:
+            scale = 2
+        scale = max(1, min(scale, 4))
+
+        # EasyOCR may print progress bars; avoid encoding crashes on some Windows setups.
+        try:
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            if hasattr(sys.stderr, "reconfigure"):
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+        np = importlib.import_module("numpy")
+        pil_image = importlib.import_module("PIL.Image")
+        easyocr = importlib.import_module("easyocr")
+
+        model_dir = _get_easyocr_model_dir()
+        reader = easyocr.Reader(
+            ["cs", "en"],
+            gpu=False,
+            model_storage_directory=model_dir,
+            verbose=False,
+        )
+
+        if png_b64:
+            png_bytes = base64.b64decode(png_b64.encode("ascii"), validate=False)
+            img = pil_image.open(io.BytesIO(png_bytes))
+        else:
+            if not image_path:
+                raise RuntimeError("Missing image input")
+            img = pil_image.open(str(image_path))
+
+        # Mild upscale helps small UI fonts; configurable for speed vs accuracy
+        img = img.resize((img.size[0] * scale, img.size[1] * scale))
+        img = img.convert("RGB")
+        img_arr = np.array(img)
+
+        if use_greedy:
+            parts = reader.readtext(img_arr, detail=0, paragraph=True, decoder="greedy")
+        else:
+            parts = reader.readtext(img_arr, detail=0, paragraph=True)
+
+        out_text = "\n".join([p.strip() for p in parts if isinstance(p, str) and p.strip()]).strip()
+        sys.stdout.write(json.dumps({"ok": True, "text": out_text}, ensure_ascii=False))
+        return 0
+    except ImportError:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "OCR Libraries Missing: python library 'easyocr' is missing. Please run: pip install easyocr",
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
+    except Exception as e:
+        sys.stdout.write(
+            json.dumps(
+                {"ok": False, "error": f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"},
+                ensure_ascii=False,
+            )
+        )
+        return 1
+
+
+def _ocr_server_main() -> int:
+    """Long-lived OCR process.
+
+    Reads one JSON object per line from stdin and writes one JSON object per line to stdout.
+    Caches EasyOCR Reader in-process so subsequent requests are fast.
+    """
+    try:
+        # Avoid noisy warnings interfering with protocols
+        try:
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            if hasattr(sys.stderr, "reconfigure"):
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+        np = importlib.import_module("numpy")
+        pil_image = importlib.import_module("PIL.Image")
+        easyocr = importlib.import_module("easyocr")
+
+        model_dir = _get_easyocr_model_dir()
+        reader = easyocr.Reader(
+            ["cs", "en"],
+            gpu=False,
+            model_storage_directory=model_dir,
+            verbose=False,
+        )
+
+        for line in sys.stdin:
+            line = (line or "").strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    raise RuntimeError("Invalid payload")
+
+                image_path = payload.get("image_path")
+                png_b64 = payload.get("png_b64")
+                use_greedy = bool(payload.get("use_greedy", False))
+                try:
+                    scale = int(payload.get("scale", 2) or 2)
+                except Exception:
+                    scale = 2
+                scale = max(1, min(scale, 4))
+
+                if png_b64:
+                    png_bytes = base64.b64decode(png_b64.encode("ascii"), validate=False)
+                    img = pil_image.open(io.BytesIO(png_bytes))
+                else:
+                    if not image_path:
+                        raise RuntimeError("Missing image input")
+                    img = pil_image.open(str(image_path))
+
+                # Mild upscale helps small UI fonts; configurable for speed vs accuracy
+                img = img.resize((img.size[0] * scale, img.size[1] * scale))
+                img = img.convert("RGB")
+                img_arr = np.array(img)
+
+                if use_greedy:
+                    parts = reader.readtext(img_arr, detail=0, paragraph=True, decoder="greedy")
+                else:
+                    parts = reader.readtext(img_arr, detail=0, paragraph=True)
+
+                out_text = "\n".join([p.strip() for p in parts if isinstance(p, str) and p.strip()]).strip()
+                sys.stdout.write(json.dumps({"ok": True, "text": out_text}, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+            except Exception as e:
+                sys.stdout.write(
+                    json.dumps(
+                        {"ok": False, "error": f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                sys.stdout.flush()
+
+        return 0
+    except ImportError:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "OCR Libraries Missing: python library 'easyocr' is missing. Please run: pip install easyocr",
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        sys.stdout.flush()
+        return 2
+    except Exception:
+        # Last-resort: don't print huge tracebacks that might break protocol consumers.
+        return 1
+
+
+# Run subprocess worker modes as early as possible (before Qt imports).
+if "--ocr-worker" in sys.argv:
+    raise SystemExit(_ocr_worker_main())
+if "--ocr-server" in sys.argv:
+    raise SystemExit(_ocr_server_main())
 
 # Prevent Qt from applying High DPI scaling
 # This ensures we get physical pixel coordinates (1920x1080) for all monitors
@@ -50,7 +276,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import Qt, QSettings, QSharedMemory, QRect, QPoint, QObject, Signal, QEvent, QUrl, QThread, QBuffer
+from PySide6.QtCore import Qt, QSettings, QSharedMemory, QRect, QPoint, QObject, Signal, QEvent, QUrl, QThread, QBuffer, QTimer
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPainter, QColor, QPen, QCursor, QPixmap, QPalette, QDesktopServices
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -92,8 +318,7 @@ class _OcrWorker(QObject):
 
             # Lazy-init and cache the reader within this worker thread (heavy)
             if self._reader is None:
-                model_dir = os.path.join(tempfile.gettempdir(), "TxtOnScrn_EasyOCR")
-                os.makedirs(model_dir, exist_ok=True)
+                model_dir = _get_easyocr_model_dir()
                 self._reader = easyocr.Reader(
                     ["cs", "en"],
                     gpu=False,
@@ -121,6 +346,92 @@ class _OcrWorker(QObject):
             self.finished.emit(out_text)
         except ImportError:
             self.error.emit("OCR Libraries Missing: python library 'easyocr' is missing. Please run: pip install easyocr")
+        except Exception as e:
+            self.error.emit(f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}")
+
+
+class _OcrSubprocessWorker(QObject):
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._proc = None
+
+    def _ensure_proc(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            return
+
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--ocr-server"]
+        else:
+            cmd = [sys.executable, os.path.abspath(__file__), "--ocr-server"]
+
+        # stderr is suppressed to keep stdout strictly as JSON lines.
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+    def shutdown(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if not proc:
+            return
+        try:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            proc.terminate()
+        except Exception:
+            pass
+
+    def run(self, payload) -> None:
+        try:
+            if not isinstance(payload, dict):
+                raise RuntimeError("Invalid OCR payload")
+
+            req = {
+                "image_path": payload.get("image_path"),
+                "png_b64": payload.get("png_b64"),
+                "use_greedy": bool(payload.get("use_greedy", False)),
+                "scale": payload.get("scale", 2),
+            }
+
+            if not req.get("image_path") and not req.get("png_b64"):
+                raise RuntimeError("Missing image input")
+
+            self._ensure_proc()
+            if not self._proc or self._proc.poll() is not None:
+                raise RuntimeError("OCR server process is not running")
+
+            line = json.dumps(req, ensure_ascii=False)
+            assert self._proc.stdin is not None
+            assert self._proc.stdout is not None
+            self._proc.stdin.write(line + "\n")
+            self._proc.stdin.flush()
+
+            out_line = self._proc.stdout.readline()
+            if not out_line:
+                raise RuntimeError("OCR server returned no output")
+
+            resp = json.loads(out_line.strip())
+            if isinstance(resp, dict) and resp.get("ok") is True:
+                self.finished.emit(str(resp.get("text") or ""))
+                return
+
+            if isinstance(resp, dict):
+                self.error.emit(str(resp.get("error") or "OCR failed"))
+            else:
+                self.error.emit("OCR failed: invalid response")
         except Exception as e:
             self.error.emit(f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}")
 
@@ -173,6 +484,10 @@ SETTINGS_ASSISTANT_SELECTED = "assistant_selected"  # e.g. "local" or "public:gr
 
 SETTINGS_OCR_USE_GREEDY = "ocr_use_greedy"  # faster, slightly less accurate
 SETTINGS_OCR_IN_MEMORY = "ocr_in_memory"  # avoid temp file I/O
+SETTINGS_OCR_SCALE = "ocr_scale"  # int: 1..4 (speed vs accuracy)
+SETTINGS_OCR_SCALE_AUTO = "ocr_scale_auto"  # bool
+SETTINGS_OCR_AUTO_RUN = "ocr_auto_run"  # bool: run OCR automatically after capture
+SETTINGS_OCR_ASSISTANT_AFTER_CAPTURE = "ocr_assistant_after_capture"  # bool: open Assistant instead of Editor
 
 SETTINGS_AI_PUBLIC_GROQ_ENABLED = "ai_provider_public_groq_enabled"
 # (záměrně jen 2 položky v Public)
@@ -405,10 +720,45 @@ class ConfigTab(QWidget):
         ocr_layout.addWidget(self.ocr_greedy_cb)
         ocr_layout.addWidget(self.ocr_in_memory_cb)
 
+        ocr_scale_row = QHBoxLayout()
+        ocr_scale_row.addWidget(QLabel("Image upscale (1 = none):"))
+        self.ocr_scale_spin = QSpinBox()
+        self.ocr_scale_spin.setRange(1, 4)
+        self.ocr_scale_spin.setToolTip("1 = no upscale (fastest). Higher = more accurate on small fonts, but slower. 2 is a good default.")
+        self.ocr_scale_spin.valueChanged.connect(lambda v: self.settings.setValue(SETTINGS_OCR_SCALE, int(v)))
+        ocr_scale_row.addWidget(self.ocr_scale_spin)
+        ocr_scale_row.addWidget(QLabel("(1=none/fast, 2=default, 3-4=slower)"))
+        ocr_scale_row.addStretch()
+        ocr_layout.addLayout(ocr_scale_row)
+
+        self.ocr_scale_auto_cb = QCheckBox("Automatic (pick scale based on selection size)")
+        self.ocr_scale_auto_cb.toggled.connect(self._on_ocr_scale_auto_toggled)
+        ocr_layout.addWidget(self.ocr_scale_auto_cb)
+
+        self.ocr_auto_run_cb = QCheckBox("Auto-run OCR after capture")
+        self.ocr_auto_run_cb.toggled.connect(lambda checked: self.settings.setValue(SETTINGS_OCR_AUTO_RUN, bool(checked)))
+        ocr_layout.addWidget(self.ocr_auto_run_cb)
+
+        self.ocr_assistant_after_capture_cb = QCheckBox("After capture: open AI assistant (skip editor)")
+        self.ocr_assistant_after_capture_cb.toggled.connect(
+            lambda checked: self.settings.setValue(SETTINGS_OCR_ASSISTANT_AFTER_CAPTURE, bool(checked))
+        )
+        ocr_layout.addWidget(self.ocr_assistant_after_capture_cb)
+
+        self.ocr_clear_cache_btn = QPushButton("Clear OCR model cache")
+        self.ocr_clear_cache_btn.setToolTip("Deletes cached EasyOCR model files from disk. They will be re-downloaded on next OCR use.")
+        self.ocr_clear_cache_btn.clicked.connect(self._on_clear_ocr_cache_clicked)
+        ocr_layout.addWidget(self.ocr_clear_cache_btn)
+
+        self.uninstall_btn = QPushButton("Uninstall / remove all app data")
+        self.uninstall_btn.setToolTip("Disables startup, clears settings (registry), and deletes app data in LocalAppData.")
+        self.uninstall_btn.clicked.connect(self._on_uninstall_clicked)
+
         layout = QVBoxLayout(self)
         layout.addWidget(self.startup_checkbox)
         layout.addLayout(hotkey_row)
         layout.addWidget(ocr_group)
+        layout.addWidget(self.uninstall_btn)
         layout.addStretch()
 
         self.refresh()
@@ -429,6 +779,135 @@ class ConfigTab(QWidget):
         self.ocr_in_memory_cb.blockSignals(True)
         self.ocr_in_memory_cb.setChecked(bool(self.settings.value(SETTINGS_OCR_IN_MEMORY, False, type=bool)))
         self.ocr_in_memory_cb.blockSignals(False)
+
+        try:
+            scale = int(self.settings.value(SETTINGS_OCR_SCALE, 2) or 2)
+        except Exception:
+            scale = 2
+        scale = max(1, min(scale, 4))
+        self.ocr_scale_spin.blockSignals(True)
+        self.ocr_scale_spin.setValue(scale)
+        self.ocr_scale_spin.blockSignals(False)
+
+        auto = bool(self.settings.value(SETTINGS_OCR_SCALE_AUTO, False, type=bool))
+        self.ocr_scale_auto_cb.blockSignals(True)
+        self.ocr_scale_auto_cb.setChecked(auto)
+        self.ocr_scale_auto_cb.blockSignals(False)
+        self.ocr_scale_spin.setEnabled(not auto)
+
+        self.ocr_auto_run_cb.blockSignals(True)
+        self.ocr_auto_run_cb.setChecked(bool(self.settings.value(SETTINGS_OCR_AUTO_RUN, False, type=bool)))
+        self.ocr_auto_run_cb.blockSignals(False)
+
+        self.ocr_assistant_after_capture_cb.blockSignals(True)
+        self.ocr_assistant_after_capture_cb.setChecked(
+            bool(self.settings.value(SETTINGS_OCR_ASSISTANT_AFTER_CAPTURE, False, type=bool))
+        )
+        self.ocr_assistant_after_capture_cb.blockSignals(False)
+
+    def _on_ocr_scale_auto_toggled(self, checked: bool) -> None:
+        self.settings.setValue(SETTINGS_OCR_SCALE_AUTO, bool(checked))
+        self.ocr_scale_spin.setEnabled(not bool(checked))
+
+    def _on_clear_ocr_cache_clicked(self) -> None:
+        model_dir = _get_easyocr_model_dir()
+        answer = QMessageBox.question(
+            self,
+            "Clear OCR cache",
+            "This will delete cached EasyOCR model files from disk.\n"
+            "OCR will download them again the next time you run OCR.\n\n"
+            f"Folder:\n{model_dir}\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        try:
+            if os.path.isdir(model_dir):
+                shutil.rmtree(model_dir, ignore_errors=False)
+            Path(model_dir).mkdir(parents=True, exist_ok=True)
+            QMessageBox.information(self, "Clear OCR cache", "OCR cache cleared.")
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Clear OCR cache",
+                "Could not clear OCR cache. If OCR is currently running, close OCR windows and try again.\n\n"
+                f"Error: {e}",
+            )
+
+    def _on_uninstall_clicked(self) -> None:
+        app_dir = _get_app_data_dir()
+        model_dir = _get_easyocr_model_dir()
+
+        answer = QMessageBox.question(
+            self,
+            "Uninstall / remove all data",
+            "This will:\n"
+            "- Disable startup (registry)\n"
+            "- Clear all app settings (registry)\n"
+            f"- Delete app data folder:\n{app_dir}\n"
+            f"  (includes OCR model cache: {model_dir})\n\n"
+            "The app will close afterwards. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        # Stop windows / OCR subprocesses first to release file locks.
+        try:
+            if self.tray_app is not None:
+                try:
+                    if getattr(self.tray_app, "ocr_assistant_flow", None) is not None:
+                        self.tray_app.ocr_assistant_flow.shutdown()
+                        self.tray_app.ocr_assistant_flow = None
+                except Exception:
+                    pass
+
+                try:
+                    if getattr(self.tray_app, "editor_window", None) is not None:
+                        self.tray_app.editor_window.close()
+                        self.tray_app.editor_window = None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        errors = []
+        try:
+            set_startup_enabled(False)
+        except Exception as e:
+            errors.append(f"Startup: {e}")
+
+        try:
+            s = QSettings(ORG_NAME, APP_NAME)
+            s.clear()
+            s.sync()
+        except Exception as e:
+            errors.append(f"Settings: {e}")
+
+        try:
+            if os.path.isdir(app_dir):
+                shutil.rmtree(app_dir)
+        except Exception as e:
+            errors.append(f"AppData: {e}")
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Uninstall / remove all data",
+                "Cleanup finished with errors:\n\n" + "\n".join(errors) + "\n\nThe app will now close.",
+            )
+        else:
+            QMessageBox.information(self, "Uninstall / remove all data", "Cleanup done. The app will now close.")
+
+        # Exit the app after the dialog closes.
+        if self.tray_app is not None:
+            QTimer.singleShot(0, self.tray_app.quit)
+        else:
+            QTimer.singleShot(0, QApplication.quit)
 
     def on_startup_toggled(self, checked: bool) -> None:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Startup toggled: {checked}")
@@ -907,17 +1386,29 @@ class AssistantDialog(QDialog):
 
         buttons = QHBoxLayout()
         buttons.addStretch()
-        apply_btn = QPushButton("Apply to editor")
-        apply_btn.setEnabled(callable(self.set_editor_text))
-        apply_btn.clicked.connect(self._apply_to_editor_clicked)
-        buttons.addWidget(apply_btn)
-        run_btn = QPushButton("Run")
-        run_btn.clicked.connect(self.on_run)
-        buttons.addWidget(run_btn)
+
+        copy_label = "Copy editor text" if callable(self.set_editor_text) else "Copy OCR text"
+        self.copy_input_btn = QPushButton(copy_label)
+        self.copy_input_btn.clicked.connect(self._copy_input_clicked)
+        buttons.addWidget(self.copy_input_btn)
+
+        self.apply_btn = QPushButton("Apply to editor")
+        self.apply_btn.setEnabled(callable(self.set_editor_text))
+        self.apply_btn.clicked.connect(self._apply_to_editor_clicked)
+        buttons.addWidget(self.apply_btn)
+        self.run_btn = QPushButton("Run")
+        self.run_btn.clicked.connect(self.on_run)
+        buttons.addWidget(self.run_btn)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
         buttons.addWidget(close_btn)
         layout.addLayout(buttons)
+
+    def set_run_enabled(self, enabled: bool) -> None:
+        try:
+            self.run_btn.setEnabled(bool(enabled))
+        except Exception:
+            pass
 
     def eventFilter(self, source, event):
         # Submit on Enter, allow newline on Shift+Enter
@@ -945,6 +1436,22 @@ class AssistantDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Apply", f"Could not apply to editor: {e}")
 
+    def _copy_input_clicked(self) -> None:
+        text = ""
+        try:
+            text = (self.get_editor_text() or "").strip()
+        except Exception:
+            text = ""
+
+        if not text:
+            QMessageBox.information(self, "Copy", "No input text to copy.")
+            return
+
+        try:
+            QApplication.clipboard().setText(text)
+        except Exception as e:
+            QMessageBox.warning(self, "Copy", f"Could not copy to clipboard: {e}")
+
     def on_run(self):
         task = (self.task_edit.toPlainText() or "").strip()
         editor_text = ""
@@ -967,7 +1474,6 @@ class AssistantDialog(QDialog):
         if not text:
             self.output_edit.setPlainText(
                 "Editor text is empty.\n\n"
-                f"Task: {task}\n"
                 "Tip: First paste text into the editor, then try e.g.: 'Summarize into 5 points'."
             )
             return
@@ -1318,8 +1824,7 @@ class AssistantDialog(QDialog):
             items = _outline_from_headings(text, max_items=n)
             return "\n".join(f"- {it}" for it in items) if items else "(No headings found.)"
 
-
-        return self._local_help_text(task=task)
+        return self._local_help_text()
 
     @staticmethod
     def _local_help_text(task: str | None = None) -> str:
@@ -1340,8 +1845,6 @@ class AssistantDialog(QDialog):
             "- JSON pretty: 'json pretty'\n"
             "- Nahradit: 'replace A -> B' nebo 's/A/B/'\n"
         )
-        if task:
-            return base + f"\nTask: {task}"
         return base
 
     def _run_public(self, task: str, editor_text: str, provider_override: str | None = None) -> None:
@@ -1380,7 +1883,7 @@ class AssistantDialog(QDialog):
             else:
                 answer = f"Provider '{provider}' is not fully implemented yet."
 
-            self.output_edit.setPlainText(answer)
+            self.output_edit.setPlainText(self._clean_public_answer(answer))
         except Exception as e:
             self.output_edit.setPlainText(f"Public AI error: {e}")
         finally:
@@ -1394,15 +1897,46 @@ class AssistantDialog(QDialog):
 
     def _build_public_prompt(self, task: str, editor_text: str) -> str:
         text = (editor_text or "").strip()
+        rules = (
+            "RULES:\n"
+            "- Output ONLY the final result.\n"
+            "- Do NOT restate or echo the user task/instructions.\n"
+            "- Do NOT include labels like 'Task:' / 'Úkol:' / 'Instruction:'.\n"
+            "- Do NOT mention these rules.\n\n"
+        )
         if text:
             return (
-                "You are an assistant. The user gives you a task and also text from the editor. "
-                "If the task relates to the text, work with it.\n\n"
-                f"Task: {task}\n\n"
-                "Text from editor:\n"
-                f"{text}"
+                rules
+                + "User instruction:\n"
+                + str(task)
+                + "\n\nInput text:\n"
+                + text
             )
-        return f"Task: {task}"
+        return rules + "User instruction:\n" + str(task)
+
+    @staticmethod
+    def _clean_public_answer(answer: str) -> str:
+        # Some models still echo the instruction. Strip obvious leading label blocks.
+        s = (answer or "").strip()
+        if not s:
+            return ""
+
+        lines = s.splitlines()
+        # Drop leading empty lines
+        while lines and not lines[0].strip():
+            lines.pop(0)
+
+        if not lines:
+            return ""
+
+        # Remove a leading "Task:/Úkol:/Instruction:" line (and a following blank line)
+        first = lines[0].strip().lower()
+        if first.startswith("task:") or first.startswith("úkol:") or first.startswith("ukol:") or first.startswith("instruction:"):
+            lines.pop(0)
+            while lines and not lines[0].strip():
+                lines.pop(0)
+
+        return "\n".join(lines).strip()
 
     def _groq_select_model(self, api_key: str) -> str:
         # Prefer a stable, commonly-available chat model. If Groq changes model names,
@@ -1510,14 +2044,194 @@ class AssistantDialog(QDialog):
         return content
 
 
+class _OcrOnceController(QObject):
+    """Runs OCR for one payload using the existing persistent OCR subprocess worker."""
+
+    ocr_request = Signal(object)
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thread = QThread(self)
+        self._worker = _OcrSubprocessWorker()
+        self._worker.moveToThread(self._thread)
+        self.ocr_request.connect(self._worker.run)
+        self._worker.finished.connect(self.finished)
+        self._worker.error.connect(self.error)
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        try:
+            self._worker.shutdown()
+        except Exception:
+            pass
+        try:
+            if self._thread.isRunning():
+                self._thread.quit()
+                self._thread.wait(1500)
+        except Exception:
+            pass
+
+
+class OcrAssistantFlow(QObject):
+    """Capture -> OCR -> open Assistant (skip EditorWindow UI)."""
+
+    def __init__(self, tray_app, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        self.tray_app = tray_app
+        self.pixmap = pixmap
+        self.settings = QSettings(ORG_NAME, APP_NAME)
+        self._source_text = ""
+        self._temp_path = None
+
+        self.dialog = AssistantDialog(
+            mode="local",
+            get_editor_text=lambda: self._source_text,
+            set_editor_text=None,
+            open_settings=lambda: self.tray_app.show_settings("general"),
+            parent=None,
+        )
+        self.dialog.output_edit.setPlainText("Running OCR…")
+        self.dialog.set_run_enabled(False)
+
+        self._ocr = _OcrOnceController()
+        self._ocr.finished.connect(self._on_ocr_finished)
+        self._ocr.error.connect(self._on_ocr_error)
+        self.dialog.destroyed.connect(lambda *_: self.shutdown())
+
+    def show(self) -> None:
+        self.dialog.show()
+        try:
+            self.dialog.raise_()
+            self.dialog.activateWindow()
+            self.dialog.task_edit.setFocus()
+        except Exception:
+            pass
+        QTimer.singleShot(0, self.start_ocr)
+
+    def shutdown(self) -> None:
+        try:
+            if getattr(self, "_ocr", None) is not None:
+                self._ocr.shutdown()
+        except Exception:
+            pass
+        self._ocr = None
+        self._cleanup_temp()
+
+    def _cleanup_temp(self) -> None:
+        temp_path = getattr(self, "_temp_path", None)
+        self._temp_path = None
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+    def _compute_ocr_scale(self) -> int:
+        use_auto_scale = bool(self.settings.value(SETTINGS_OCR_SCALE_AUTO, False, type=bool))
+        try:
+            scale = int(self.settings.value(SETTINGS_OCR_SCALE, 2) or 2)
+        except Exception:
+            scale = 2
+
+        if use_auto_scale:
+            try:
+                w = int(self.pixmap.width())
+                h = int(self.pixmap.height())
+            except Exception:
+                w, h = 0, 0
+            area = w * h
+            if area <= 0:
+                scale = 2
+            elif area < 700_000:
+                scale = 3
+            elif area < 2_200_000:
+                scale = 2
+            else:
+                scale = 1
+
+        return max(1, min(int(scale), 4))
+
+    def start_ocr(self) -> None:
+        # Always auto-run OCR in this flow.
+        try:
+            self.dialog.output_edit.setPlainText("Running OCR…")
+            self.dialog.set_run_enabled(False)
+        except Exception:
+            pass
+
+        use_in_memory = bool(self.settings.value(SETTINGS_OCR_IN_MEMORY, False, type=bool))
+        use_greedy = bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, False, type=bool))
+        scale = self._compute_ocr_scale()
+
+        payload = {
+            "use_greedy": use_greedy,
+            "image_path": None,
+            "png_b64": None,
+            "scale": scale,
+        }
+
+        self._cleanup_temp()
+
+        if use_in_memory:
+            buf = QBuffer()
+            buf.open(QBuffer.ReadWrite)
+            ok = self.pixmap.save(buf, "PNG")
+            if not ok:
+                self._on_ocr_error("OCR Error: Could not encode image.")
+                return
+            payload["png_b64"] = base64.b64encode(bytes(buf.data())).decode("ascii")
+            buf.close()
+        else:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                self._temp_path = f.name
+            self.pixmap.save(self._temp_path)
+            if not self._temp_path or not os.path.exists(self._temp_path) or os.path.getsize(self._temp_path) == 0:
+                self._on_ocr_error("OCR Error: Could not save image.")
+                return
+            payload["image_path"] = self._temp_path
+
+        self._ocr.ocr_request.emit(payload)
+
+    def _on_ocr_finished(self, out_text: str) -> None:
+        self._source_text = (out_text or "").strip()
+        self._cleanup_temp()
+
+        if self._source_text:
+            self.dialog.output_edit.setPlainText("OCR ready. Enter task and press Run.")
+        else:
+            self.dialog.output_edit.setPlainText("OCR finished: no text detected. You can still ask a question.")
+
+        self.dialog.set_run_enabled(True)
+        try:
+            self.dialog.task_edit.setFocus()
+        except Exception:
+            pass
+
+    def _on_ocr_error(self, message: str) -> None:
+        self._cleanup_temp()
+        self._source_text = ""
+        self.dialog.output_edit.setPlainText(str(message or "OCR failed"))
+        # Still allow using Assistant for unrelated questions.
+        self.dialog.set_run_enabled(True)
+        try:
+            self.dialog.task_edit.setFocus()
+        except Exception:
+            pass
+
+
 class EditorWindow(QWidget):
     ocr_request = Signal(object)
     enhance_request = Signal(str)
+    ocr_shutdown = Signal()
 
     def __init__(self, pixmap: QPixmap, tray_app=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Editor")
         self.setWindowIcon(QIcon(resource_path("ico.ico")))
+        # Ensure the QWidget is deleted when closed (prevents keeping heavy resources alive)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.resize(800, 600)
         
         self.original_pixmap = pixmap
@@ -1560,7 +2274,10 @@ class EditorWindow(QWidget):
 
         copy_text_action = QAction("Copy", self)
         copy_text_action.setShortcut(QKeySequence.Copy)
-        copy_text_action.triggered.connect(lambda: self.text_edit.copy())
+        # Make sure Ctrl+C works even if focus/menus behave oddly on QWidget+QMenuBar.
+        copy_text_action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        copy_text_action.triggered.connect(self.copy_text_to_clipboard)
+        self.addAction(copy_text_action)
         edit_menu.addAction(copy_text_action)
 
         undo_action = QAction("Undo", self)
@@ -1632,11 +2349,12 @@ class EditorWindow(QWidget):
 
         self._assistant_dialog = None
 
-        # OCR worker thread (keeps EasyOCR reader cached in a single thread)
+        # OCR worker thread (runs OCR in a separate process to avoid keeping Torch/EasyOCR RAM in the tray process)
         self._ocr_thread = QThread(self)
-        self._ocr_worker = _OcrWorker()
+        self._ocr_worker = _OcrSubprocessWorker()
         self._ocr_worker.moveToThread(self._ocr_thread)
         self.ocr_request.connect(self._ocr_worker.run)
+        self.ocr_shutdown.connect(self._ocr_worker.shutdown)
         self._ocr_worker.finished.connect(self._on_ocr_finished)
         self._ocr_worker.error.connect(self._on_ocr_error)
         self._ocr_thread.start()
@@ -1655,6 +2373,22 @@ class EditorWindow(QWidget):
 
         self._enhance_progress = None
         self._enhance_temp_path = None
+
+    def copy_text_to_clipboard(self) -> None:
+        # QTextEdit.copy() copies only selection; if user has no selection,
+        # copy the whole text to match common expectations.
+        try:
+            cursor = self.text_edit.textCursor()
+            if cursor is not None and cursor.hasSelection():
+                self.text_edit.copy()
+            else:
+                (QApplication.clipboard()).setText(self.text_edit.toPlainText() or "")
+        except Exception:
+            # Fallback: best-effort
+            try:
+                (QApplication.clipboard()).setText(self.text_edit.toPlainText() or "")
+            except Exception:
+                pass
 
     def open_settings(self):
         if self.tray_app and hasattr(self.tray_app, "show_settings"):
@@ -1690,6 +2424,10 @@ class EditorWindow(QWidget):
         self.settings.setValue("editor_splitter_state", self.splitter.saveState())
         try:
             if hasattr(self, "_ocr_thread") and self._ocr_thread and self._ocr_thread.isRunning():
+                try:
+                    self.ocr_shutdown.emit()
+                except Exception:
+                    pass
                 self._ocr_thread.quit()
                 self._ocr_thread.wait(1500)
         except Exception:
@@ -1699,6 +2437,13 @@ class EditorWindow(QWidget):
             if hasattr(self, "_enhance_thread") and self._enhance_thread and self._enhance_thread.isRunning():
                 self._enhance_thread.quit()
                 self._enhance_thread.wait(1500)
+        except Exception:
+            pass
+
+        # Drop TrayApp's reference so this window can be garbage-collected.
+        try:
+            if self.tray_app is not None and getattr(self.tray_app, "editor_window", None) is self:
+                self.tray_app.editor_window = None
         except Exception:
             pass
         super().closeEvent(event)
@@ -1745,10 +2490,38 @@ class EditorWindow(QWidget):
             use_in_memory = bool(self.settings.value(SETTINGS_OCR_IN_MEMORY, False, type=bool))
             use_greedy = bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, False, type=bool))
 
+            use_auto_scale = bool(self.settings.value(SETTINGS_OCR_SCALE_AUTO, False, type=bool))
+
+            try:
+                scale = int(self.settings.value(SETTINGS_OCR_SCALE, 2) or 2)
+            except Exception:
+                scale = 2
+
+            if use_auto_scale:
+                # Simple heuristic: larger selections benefit from speed (lower scale),
+                # small selections benefit from accuracy (higher scale).
+                try:
+                    w = int(self.original_pixmap.width())
+                    h = int(self.original_pixmap.height())
+                except Exception:
+                    w, h = 0, 0
+                area = w * h
+                if area <= 0:
+                    scale = 2
+                elif area < 700_000:  # e.g. ~1000x700
+                    scale = 3
+                elif area < 2_200_000:  # e.g. ~1920x1080
+                    scale = 2
+                else:
+                    scale = 1
+
+            scale = max(1, min(scale, 4))
+
             payload = {
                 "use_greedy": use_greedy,
                 "image_path": None,
-                "png_bytes": None,
+                "png_b64": None,
+                "scale": scale,
             }
 
             if use_in_memory:
@@ -1758,7 +2531,7 @@ class EditorWindow(QWidget):
                 if not ok:
                     self.text_edit.append("Error: Could not encode image.")
                     return
-                payload["png_bytes"] = bytes(buf.data())
+                payload["png_b64"] = base64.b64encode(bytes(buf.data())).decode("ascii")
                 buf.close()
                 self._ocr_temp_path = None
             else:
@@ -2196,6 +2969,7 @@ class TrayApp:
         self.settings = QSettings(ORG_NAME, APP_NAME)
         self.current_hotkey = None
         self.editor_window = None
+        self.ocr_assistant_flow = None
 
         # Apply appearance theme early
         apply_theme_mode(self.settings.value(SETTINGS_THEME_MODE, "system"))
@@ -2293,12 +3067,48 @@ class TrayApp:
 
     def open_editor(self, pixmap: QPixmap):
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Opening editor")
+
+        # Optional: open Assistant directly (skip editor) and feed OCR text as its input context
+        try:
+            raw_flag = self.settings.value(SETTINGS_OCR_ASSISTANT_AFTER_CAPTURE, False)
+            if isinstance(raw_flag, bool):
+                flag = raw_flag
+            else:
+                s = str(raw_flag).strip().lower()
+                flag = s in {"1", "true", "yes", "y", "on"}
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] assistant_after_capture={raw_flag!r} ({type(raw_flag).__name__}) -> {flag}"
+            )
+
+            if flag:
+                if self.ocr_assistant_flow is not None:
+                    try:
+                        self.ocr_assistant_flow.shutdown()
+                    except Exception:
+                        pass
+                self.ocr_assistant_flow = OcrAssistantFlow(tray_app=self, pixmap=pixmap)
+                self.ocr_assistant_flow.show()
+                return
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] assistant_after_capture failed: {e}\n{traceback.format_exc()}")
+
         # If editor already exists, close or update it
         if self.editor_window:
-            self.editor_window.close()
-            
+            try:
+                self.editor_window.close()
+            finally:
+                # Ensure we don't keep a stale reference if close does not immediately delete.
+                self.editor_window = None
+
         self.editor_window = EditorWindow(pixmap, tray_app=self)
         self.editor_window.show()
+
+        # Optional: run OCR automatically right after capture
+        try:
+            if bool(self.settings.value(SETTINGS_OCR_AUTO_RUN, False, type=bool)):
+                QTimer.singleShot(0, self.editor_window.run_ocr)
+        except Exception:
+            pass
 
     def _overlay_destroyed(self, obj=None):
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay destroyed")
@@ -2331,6 +3141,18 @@ class TrayApp:
             return False
 
     def quit(self):
+        if self.ocr_assistant_flow is not None:
+            try:
+                self.ocr_assistant_flow.shutdown()
+            except Exception:
+                pass
+            self.ocr_assistant_flow = None
+        if self.editor_window:
+            try:
+                self.editor_window.close()
+            except Exception:
+                pass
+            self.editor_window = None
         if self.current_hotkey:
             try:
                 keyboard.remove_hotkey(self.current_hotkey)
