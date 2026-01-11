@@ -894,6 +894,14 @@ class ConfigTab(QWidget):
         except Exception as e:
             errors.append(f"AppData: {e}")
 
+        # Legacy: older versions stored EasyOCR models in %TEMP%\TxtOnScrn_EasyOCR
+        try:
+            legacy_dir = os.path.join(tempfile.gettempdir(), "TxtOnScrn_EasyOCR")
+            if os.path.isdir(legacy_dir):
+                shutil.rmtree(legacy_dir)
+        except Exception as e:
+            errors.append(f"LegacyTemp: {e}")
+
         if errors:
             QMessageBox.warning(
                 self,
