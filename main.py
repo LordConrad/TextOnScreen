@@ -10,6 +10,7 @@ import io
 import subprocess
 import urllib.request
 import urllib.error
+import urllib.parse
 import re
 import shutil
 import importlib
@@ -490,9 +491,13 @@ SETTINGS_OCR_AUTO_RUN = "ocr_auto_run"  # bool: run OCR automatically after capt
 SETTINGS_OCR_ASSISTANT_AFTER_CAPTURE = "ocr_assistant_after_capture"  # bool: open Assistant instead of Editor
 
 SETTINGS_AI_PUBLIC_GROQ_ENABLED = "ai_provider_public_groq_enabled"
-# (záměrně jen 2 položky v Public)
+SETTINGS_AI_PUBLIC_OPENAI_ENABLED = "ai_provider_public_openai_enabled"
+SETTINGS_AI_PUBLIC_GEMINI_ENABLED = "ai_provider_public_gemini_enabled"
+# (záměrně jednoduché – Public providery se přepínají jako rádio)
 
 SETTINGS_AI_PUBLIC_GROQ_API_KEY = "ai_public_groq_api_key"
+SETTINGS_AI_PUBLIC_OPENAI_API_KEY = "ai_public_openai_api_key"
+SETTINGS_AI_PUBLIC_GEMINI_API_KEY = "ai_public_gemini_api_key"
 SETTINGS_AI_GROQ_ENABLED = "ai_provider_groq_enabled"
 
 DEFAULT_SNIP_BORDER_COLOR = "#aaaaff"
@@ -1006,10 +1011,16 @@ class SettingsDialog(QDialog):
         public_group = QGroupBox("Public")
         public_layout = QVBoxLayout(public_group)
         self.ai_pub_groq_cb = QCheckBox("Groq")
+        self.ai_pub_openai_cb = QCheckBox("OpenAI (ChatGPT)")
+        self.ai_pub_gemini_cb = QCheckBox("Google Gemini")
 
         self.ai_pub_groq_cb.toggled.connect(lambda checked: self.on_public_provider_toggled(self.ai_pub_groq_cb, SETTINGS_AI_PUBLIC_GROQ_ENABLED, checked))
+        self.ai_pub_openai_cb.toggled.connect(lambda checked: self.on_public_provider_toggled(self.ai_pub_openai_cb, SETTINGS_AI_PUBLIC_OPENAI_ENABLED, checked))
+        self.ai_pub_gemini_cb.toggled.connect(lambda checked: self.on_public_provider_toggled(self.ai_pub_gemini_cb, SETTINGS_AI_PUBLIC_GEMINI_ENABLED, checked))
 
         public_layout.addWidget(self.ai_pub_groq_cb)
+        public_layout.addWidget(self.ai_pub_openai_cb)
+        public_layout.addWidget(self.ai_pub_gemini_cb)
 
         public_key_row = QHBoxLayout()
         self.public_api_key_label = QLabel("API key:")
@@ -1104,6 +1115,14 @@ class SettingsDialog(QDialog):
             self.ai_pub_groq_cb.blockSignals(True)
             self.ai_pub_groq_cb.setChecked(bool(self.settings.value(SETTINGS_AI_PUBLIC_GROQ_ENABLED, False, type=bool)))
             self.ai_pub_groq_cb.blockSignals(False)
+        if hasattr(self, "ai_pub_openai_cb"):
+            self.ai_pub_openai_cb.blockSignals(True)
+            self.ai_pub_openai_cb.setChecked(bool(self.settings.value(SETTINGS_AI_PUBLIC_OPENAI_ENABLED, False, type=bool)))
+            self.ai_pub_openai_cb.blockSignals(False)
+        if hasattr(self, "ai_pub_gemini_cb"):
+            self.ai_pub_gemini_cb.blockSignals(True)
+            self.ai_pub_gemini_cb.setChecked(bool(self.settings.value(SETTINGS_AI_PUBLIC_GEMINI_ENABLED, False, type=bool)))
+            self.ai_pub_gemini_cb.blockSignals(False)
 
         self._refresh_public_key_ui()
 
@@ -1115,6 +1134,8 @@ class SettingsDialog(QDialog):
 
         url = {
             "groq": "https://console.groq.com/keys",
+            "openai": "https://platform.openai.com/api-keys",
+            "gemini": "https://aistudio.google.com/app/apikey",
         }[provider]
         QDesktopServices.openUrl(QUrl(url))
 
@@ -1153,6 +1174,8 @@ class SettingsDialog(QDialog):
 
         key_setting = {
             "groq": SETTINGS_AI_PUBLIC_GROQ_API_KEY,
+            "openai": SETTINGS_AI_PUBLIC_OPENAI_API_KEY,
+            "gemini": SETTINGS_AI_PUBLIC_GEMINI_API_KEY,
         }[provider]
         self.settings.setValue(key_setting, _dpapi_encrypt_to_b64(value))
 
@@ -1176,6 +1199,8 @@ class SettingsDialog(QDialog):
         if checked:
             for other_cb, other_key in (
                 (self.ai_pub_groq_cb, SETTINGS_AI_PUBLIC_GROQ_ENABLED),
+                (self.ai_pub_openai_cb, SETTINGS_AI_PUBLIC_OPENAI_ENABLED),
+                (self.ai_pub_gemini_cb, SETTINGS_AI_PUBLIC_GEMINI_ENABLED),
             ):
                 if other_cb is checkbox:
                     continue
@@ -1190,6 +1215,10 @@ class SettingsDialog(QDialog):
     def _get_selected_public_provider(self):
         if self.ai_pub_groq_cb.isChecked():
             return "groq"
+        if self.ai_pub_openai_cb.isChecked():
+            return "openai"
+        if self.ai_pub_gemini_cb.isChecked():
+            return "gemini"
         return None
 
     def _refresh_public_key_ui(self) -> None:
@@ -1200,6 +1229,12 @@ class SettingsDialog(QDialog):
         if provider == "groq":
             self.public_api_key_label.setText("Groq API key:")
             setting_key = SETTINGS_AI_PUBLIC_GROQ_API_KEY
+        elif provider == "openai":
+            self.public_api_key_label.setText("OpenAI API key:")
+            setting_key = SETTINGS_AI_PUBLIC_OPENAI_API_KEY
+        elif provider == "gemini":
+            self.public_api_key_label.setText("Gemini API key:")
+            setting_key = SETTINGS_AI_PUBLIC_GEMINI_API_KEY
         else:
             self.public_api_key_label.setText("API key:")
             setting_key = None
@@ -1242,6 +1277,27 @@ class SettingsDialog(QDialog):
                 )
                 if status == 200:
                     return True, "Groq key is valid"
+                return False, f"HTTP {status}"
+
+            if provider == "openai":
+                status, body = self._http_json(
+                    "https://api.openai.com/v1/models",
+                    headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+                )
+                if status == 200:
+                    # Note: This only proves the key is accepted. Chat/completions may still fail
+                    # if billing/quota is not enabled for the org/project.
+                    return True, "OpenAI key je valid (pozn.: pro generování je potřeba mít aktivní billing/kvótu)"
+                return False, f"HTTP {status}"
+
+            if provider == "gemini":
+                # Gemini (Google AI Studio) uses API key in query param.
+                status, body = self._http_json(
+                    f"https://generativelanguage.googleapis.com/v1beta/models?key={urllib.parse.quote(api_key)}",
+                    headers={"Accept": "application/json"},
+                )
+                if status == 200:
+                    return True, "Gemini API key je valid"
                 return False, f"HTTP {status}"
 
             return False, "Unknown provider"
@@ -1365,6 +1421,8 @@ class AssistantDialog(QDialog):
         self.assistant_combo = QComboBox()
         self.assistant_combo.addItem("Local (offline)", "local")
         self.assistant_combo.addItem("Public (Groq)", "public:groq")
+        self.assistant_combo.addItem("Public (OpenAI)", "public:openai")
+        self.assistant_combo.addItem("Public (Gemini)", "public:gemini")
         self.assistant_combo.currentIndexChanged.connect(self._on_assistant_changed)
         top_row.addWidget(self.assistant_combo, 1)
 
@@ -1526,7 +1584,15 @@ class AssistantDialog(QDialog):
         if mode == "local":
             self.setWindowTitle("Local Assistant")
         else:
-            title_provider = (provider or "public").capitalize()
+            p = (provider or "public").strip().lower()
+            if p == "openai":
+                title_provider = "OpenAI"
+            elif p == "groq":
+                title_provider = "Groq"
+            elif p == "gemini":
+                title_provider = "Gemini"
+            else:
+                title_provider = (provider or "public").capitalize()
             self.setWindowTitle(f"Public Assistant ({title_provider})")
 
         # Persist selection for next app start
@@ -1552,7 +1618,7 @@ class AssistantDialog(QDialog):
             "Public Assistant – nápověda:\n"
             f"- Provider: {p}\n"
             "- API klíč nastav v Settings → AI → Public\n"
-            "- Doporučeno: Groq\n"
+            "- Podporováno: Groq, OpenAI, Gemini\n"
         )
 
     def _open_settings_clicked(self) -> None:
@@ -1868,8 +1934,14 @@ class AssistantDialog(QDialog):
         if provider == "groq":
             encrypted = str(settings.value(SETTINGS_AI_PUBLIC_GROQ_API_KEY, "") or "")
             api_key = _dpapi_decrypt_from_b64(encrypted).strip()
+        elif provider == "openai":
+            encrypted = str(settings.value(SETTINGS_AI_PUBLIC_OPENAI_API_KEY, "") or "")
+            api_key = _dpapi_decrypt_from_b64(encrypted).strip()
+        elif provider == "gemini":
+            encrypted = str(settings.value(SETTINGS_AI_PUBLIC_GEMINI_API_KEY, "") or "")
+            api_key = _dpapi_decrypt_from_b64(encrypted).strip()
         else:
-            self.output_edit.setPlainText("No supported public AI provider selected (Groq only).")
+            self.output_edit.setPlainText("No supported public AI provider selected.")
             return
 
         if not api_key:
@@ -1888,6 +1960,10 @@ class AssistantDialog(QDialog):
             answer = ""
             if provider == "groq":
                 answer = self._groq_generate(api_key=api_key, prompt=prompt)
+            elif provider == "openai":
+                answer = self._openai_generate(api_key=api_key, prompt=prompt)
+            elif provider == "gemini":
+                answer = self._gemini_generate(api_key=api_key, prompt=prompt)
             else:
                 answer = f"Provider '{provider}' is not fully implemented yet."
 
@@ -1901,6 +1977,10 @@ class AssistantDialog(QDialog):
     def _get_selected_public_provider(self, settings: QSettings):
         if bool(settings.value(SETTINGS_AI_PUBLIC_GROQ_ENABLED, False, type=bool)):
             return "groq"
+        if bool(settings.value(SETTINGS_AI_PUBLIC_OPENAI_ENABLED, False, type=bool)):
+            return "openai"
+        if bool(settings.value(SETTINGS_AI_PUBLIC_GEMINI_ENABLED, False, type=bool)):
+            return "gemini"
         return None
 
     def _build_public_prompt(self, task: str, editor_text: str) -> str:
@@ -2050,6 +2130,217 @@ class AssistantDialog(QDialog):
             raise RuntimeError("Empty response content")
 
         return content
+
+    def _openai_select_model(self, api_key: str) -> str:
+        preferences = [
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-4.1-mini",
+            "gpt-4.1",
+        ]
+
+        url = "https://api.openai.com/v1/models"
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return preferences[0]
+
+        try:
+            body = json.loads(raw)
+        except Exception:
+            return preferences[0]
+
+        data = body.get("data") or []
+        ids = [m.get("id") for m in data if isinstance(m, dict) and m.get("id")]
+        for pref in preferences:
+            if pref in ids:
+                return pref
+        return ids[0] if ids else preferences[0]
+
+    def _openai_generate(self, api_key: str, prompt: str) -> str:
+        model = getattr(self, "_openai_model", "") or self._openai_select_model(api_key)
+        self._openai_model = model
+
+        url = "https://api.openai.com/v1/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.7,
+        }
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            raw_err = e.read().decode("utf-8", errors="replace")
+
+            # Try to extract structured OpenAI error details
+            try:
+                body_err = json.loads(raw_err)
+            except Exception:
+                body_err = None
+
+            code = None
+            msg = None
+            if isinstance(body_err, dict):
+                err = body_err.get("error")
+                if isinstance(err, dict):
+                    code = err.get("code")
+                    msg = err.get("message")
+
+            if e.code == 429 and code == "insufficient_quota":
+                raise RuntimeError(
+                    "OpenAI odpovědělo 429: insufficient_quota – API key je valid, ale účet/organizace nemá aktivní billing nebo nemá dostupnou kvótu.\n\n"
+                    "Co zkontrolovat:\n"
+                    "- OpenAI Platform → Billing: zapnout platby / přidat platební metodu\n"
+                    "- Jestli klíč patří do správného projektu/organizace\n"
+                    "- Nastavené limity (monthly hard limit / budget)\n\n"
+                    "Detail od API:\n"
+                    + (msg or raw_err)
+                )
+
+            if e.code == 429 and code == "rate_limit_exceeded":
+                raise RuntimeError(
+                    "OpenAI odpovědělo 429: rate_limit_exceeded – příliš mnoho požadavků. Zkus to za chvíli, nebo sniž frekvenci/velikost promptu.\n\n"
+                    "Detail od API:\n"
+                    + (msg or raw_err)
+                )
+
+            raise RuntimeError(f"HTTP {e.code}: {raw_err}")
+
+        body = json.loads(raw)
+        choices = body.get("choices") or []
+        if not choices:
+            raise RuntimeError("No choices in response")
+
+        message = choices[0].get("message") or {}
+        content = message.get("content") or ""
+        if not content:
+            raise RuntimeError("Empty response content")
+        return content
+
+    def _gemini_select_model(self, api_key: str) -> str:
+        # Prefer a fast, cheap model; fall back if listing fails.
+        preferences = [
+            "gemini-1.5-flash",
+            "gemini-1.5-pro",
+        ]
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={urllib.parse.quote(api_key)}"
+        req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return preferences[0]
+
+        try:
+            body = json.loads(raw)
+        except Exception:
+            return preferences[0]
+
+        models = body.get("models") or []
+        names = []
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            name = m.get("name")
+            if isinstance(name, str) and name.startswith("models/"):
+                names.append(name.split("/", 1)[1])
+
+        for pref in preferences:
+            if pref in names:
+                return pref
+        return names[0] if names else preferences[0]
+
+    def _gemini_generate(self, api_key: str, prompt: str) -> str:
+        model = getattr(self, "_gemini_model", "") or self._gemini_select_model(api_key)
+        self._gemini_model = model
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model)}:generateContent?key={urllib.parse.quote(api_key)}"
+        payload = {
+            "contents": [
+                {"role": "user", "parts": [{"text": prompt}]}
+            ],
+            "generationConfig": {
+                "temperature": 0.7,
+            },
+        }
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            raw_err = e.read().decode("utf-8", errors="replace")
+            # Gemini errors are typically JSON with {"error": {"message": ...}}
+            try:
+                body_err = json.loads(raw_err)
+            except Exception:
+                body_err = None
+            msg = None
+            if isinstance(body_err, dict):
+                err = body_err.get("error")
+                if isinstance(err, dict):
+                    msg = err.get("message")
+            raise RuntimeError(f"HTTP {e.code}: {msg or raw_err}")
+
+        body = json.loads(raw)
+        candidates = body.get("candidates") or []
+        if not candidates:
+            raise RuntimeError("No candidates in response")
+
+        content = (candidates[0].get("content") or {}) if isinstance(candidates[0], dict) else {}
+        parts = content.get("parts") or []
+        if not parts:
+            raise RuntimeError("Empty response content")
+
+        # parts can contain multiple chunks; concatenate text parts
+        out = []
+        for p in parts:
+            if isinstance(p, dict) and p.get("text"):
+                out.append(str(p.get("text")))
+        text_out = "".join(out).strip()
+        if not text_out:
+            raise RuntimeError("Empty response text")
+        return text_out
 
 
 class _OcrOnceController(QObject):

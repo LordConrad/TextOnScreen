@@ -53,4 +53,6 @@ Use [build.bat](build.bat). Output is an **onedir** build:
 Although the core of the application is functional, please note the current status of AI features:
 
 - **Public AI Assistant:** **Groq works** (OpenAI-compatible endpoint).
+- **Public AI Assistant:** **OpenAI works** via API key (it does not use “Sign in with ChatGPT/OpenAI account”; user must generate an API key in OpenAI Platform).
+- **Public AI Assistant:** **Gemini works** via Google AI Studio API key.
 - **Local Assistant:** Works **offline** for text operations (summaries, bullets, cleanup, stats, sort/dedupe, keywords, outline, simple replace). It is not connected to local model servers (Ollama, LM Studio, etc.) yet, although the options are visible in settings.
