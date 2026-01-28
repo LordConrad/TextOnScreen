@@ -3,8 +3,23 @@ setlocal EnableExtensions
 
 set "DEBUG_MODE=0"
 
-if /I "%~2"=="debug" (
-    set "DEBUG_MODE=1"
+set "DO_RELEASE=0"
+
+REM Parse args in any order: onedir|onefile, debug, release
+set "BUILD_TYPE=onefile"
+for %%A in (%*) do (
+    if /I "%%~A"=="debug" (
+        set "DEBUG_MODE=1"
+    ) else if /I "%%~A"=="release" (
+        set "DO_RELEASE=1"
+    ) else if /I "%%~A"=="onefile" (
+        set "BUILD_TYPE=onefile"
+    ) else if /I "%%~A"=="onedir" (
+        set "BUILD_TYPE=onedir"
+    )
+)
+
+if "%DEBUG_MODE%"=="1" (
     echo on
     echo [DEBUG] echo ON
 )
@@ -21,10 +36,6 @@ chcp 65001 >nul
 
 set PYTHON_EXE=python
 if exist "%~dp0.venv\Scripts\python.exe" set PYTHON_EXE="%~dp0.venv\Scripts\python.exe"
-
-set BUILD_TYPE=onedir
-if /I "%~1"=="onefile" set BUILD_TYPE=onefile
-if /I "%~1"=="onedir" set BUILD_TYPE=onedir
 
 set SPEC_FILE=TxtOnScrn.spec
 if /I "%BUILD_TYPE%"=="onefile" set SPEC_FILE=TxtOnScrn_onefile.spec
@@ -82,6 +93,25 @@ if /I "%BUILD_TYPE%"=="onedir" (
     )
 )
 
+if "%DO_RELEASE%"=="1" (
+    echo(
+    echo Creating release package...
+    if not exist "%~dp0release" mkdir "%~dp0release" >nul 2>&1
+
+    if /I "%BUILD_TYPE%"=="onedir" (
+        call :delete_dir "%~dp0release\TxtOnScrn" 5
+        xcopy "%~dp0dist\TxtOnScrn" "%~dp0release\TxtOnScrn" /E /I /Y >nul
+        powershell -NoProfile -Command "Compress-Archive -Path '%~dp0release\\TxtOnScrn\\*' -DestinationPath '%~dp0release\\TxtOnScrn_onedir_release.zip' -Force" >nul 2>&1
+        echo Release folder: release\TxtOnScrn
+        echo Release zip:    release\TxtOnScrn_onedir_release.zip
+    ) else (
+        copy /Y "%~dp0dist\TxtOnScrn.exe" "%~dp0release\TxtOnScrn.exe" >nul
+        powershell -NoProfile -Command "Compress-Archive -Path '%~dp0release\\TxtOnScrn.exe' -DestinationPath '%~dp0release\\TxtOnScrn_onefile_release.zip' -Force" >nul 2>&1
+        echo Release exe:    release\TxtOnScrn.exe
+        echo Release zip:    release\TxtOnScrn_onefile_release.zip
+    )
+)
+
 echo(
 echo Build completed!
 if /I "%BUILD_TYPE%"=="onedir" (
@@ -95,8 +125,13 @@ if /I "%BUILD_TYPE%"=="onedir" (
 
 echo(
 echo Usage:
-echo   build.bat onedir   ^(default^)
-echo   build.bat onefile  ^(single .exe for copying to another PC^)
+echo   build.bat              ^(default: onefile^)
+echo   build.bat onedir       ^(folder build: exe + _internal^)
+echo   build.bat onefile      ^(single .exe for copying to another PC^)
+echo   build.bat release      ^(build default onefile and create release\ + zip^)
+echo   build.bat onedir release
+echo   build.bat onefile release
+echo   build.bat onefile debug
 
 endlocal
 

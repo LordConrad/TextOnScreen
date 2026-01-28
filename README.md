@@ -50,10 +50,17 @@ In Settings → General → OCR:
 
 ## Build (PyInstaller)
 
-Use [build.bat](build.bat). Output is an **onedir** build:
+Use [build.bat](build.bat).
 
-- `dist\TxtOnScrn\TxtOnScrn.exe`
-- Copy/run the entire `dist\TxtOnScrn` folder (do not move only the EXE).
+- Default is **onefile** (single EXE): `dist\TxtOnScrn.exe`
+- **onedir** build (folder): `dist\TxtOnScrn\TxtOnScrn.exe` (copy/run the whole folder, do not move only the EXE)
+
+### Release packaging
+
+You can also create a ready-to-copy `release\` output (plus ZIP):
+
+- `build.bat release` (default onefile + `release\TxtOnScrn.exe` + ZIP)
+- `build.bat onedir release` (copies full folder + ZIP)
 
 ## Known Limitations and Planned Development
 
