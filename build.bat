@@ -25,7 +25,7 @@ REM Check if pyinstaller is installed
 %PYTHON_EXE% -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
     echo PyInstaller nenalezen. Instaluji...
-    %PYTHON_EXE% -m pip install pyinstaller
+    %PYTHON_EXE% -m pip install --upgrade pyinstaller
 )
 
 REM Build the executable
@@ -38,10 +38,10 @@ if not exist "%~dp0dist\TxtOnScrn\TxtOnScrn.exe" (
     echo Check PyInstaller output above.
     exit /b 1
 )
-if not exist "%~dp0dist\TxtOnScrn\_internal\python313.dll" (
+if not exist "%~dp0dist\TxtOnScrn\_internal\python*.dll" (
     echo.
-    echo WARNING: python313.dll not found in dist\TxtOnScrn\_internal
-    echo If you see "python313.dll was not found" at runtime,
+    echo WARNING: python*.dll not found in dist\TxtOnScrn\_internal
+    echo If you see "pythonXXX.dll was not found" at runtime,
     echo make sure you run/copy the ENTIRE dist\TxtOnScrn folder (exe + _internal).
 )
 
