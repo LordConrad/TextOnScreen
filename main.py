@@ -14,8 +14,194 @@ import urllib.parse
 import re
 import shutil
 import importlib
+import threading
+import asyncio
 from pathlib import Path
 from datetime import datetime
+
+
+def _prepare_image_for_ocr(img, scale: int, use_greedy: bool):
+    """Prepare PIL image for OCR with sane bounds.
+
+    The previous implementation always upscaled by `scale`, which can explode the pixel count
+    for large selections (e.g. 4K * scale=2 -> ~33MP) and make OCR take minutes.
+
+    This helper keeps user-requested upscale for small crops, but caps the final resolution
+    so OCR stays typically in the order of seconds.
+    """
+    pil_image = importlib.import_module("PIL.Image")
+
+    try:
+        s = int(scale or 1)
+    except Exception:
+        s = 1
+    s = max(1, min(s, 4))
+
+    # Convert early so resize works consistently.
+    img = img.convert("RGB")
+
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return img
+
+    # Target size after user upscale.
+    tw = max(1, int(w * s))
+    th = max(1, int(h * s))
+
+    # Hard caps to keep OCR fast.
+    # Greedy/fast mode gets a lower cap.
+    max_pixels = 1_600_000 if use_greedy else 2_600_000
+    max_long_edge = 1600 if use_greedy else 2200
+
+    # Compute a limiter to respect caps.
+    limiter = 1.0
+    try:
+        if tw * th > max_pixels:
+            limiter = min(limiter, (max_pixels / float(tw * th)) ** 0.5)
+    except Exception:
+        pass
+    try:
+        long_edge = max(tw, th)
+        if long_edge > max_long_edge:
+            limiter = min(limiter, max_long_edge / float(long_edge))
+    except Exception:
+        pass
+
+    fw = max(1, int(tw * limiter))
+    fh = max(1, int(th * limiter))
+
+    # Avoid needless work if size is unchanged.
+    if fw == w and fh == h:
+        return img
+
+    # Use LANCZOS for both downscale and moderate upscale.
+    return img.resize((fw, fh), resample=pil_image.LANCZOS)
+
+
+def _light_ocr_preprocess(img):
+    """Cheap preprocessing that can help UI text detection.
+
+    Used only as a retry path when OCR returns no text.
+    """
+    try:
+        pil_ops = importlib.import_module("PIL.ImageOps")
+        pil_enhance = importlib.import_module("PIL.ImageEnhance")
+        pil_filter = importlib.import_module("PIL.ImageFilter")
+
+        x = img.convert("RGB")
+        x = pil_ops.autocontrast(x)
+        x = pil_enhance.Contrast(x).enhance(1.2)
+        x = x.filter(pil_filter.UnsharpMask(radius=2, percent=150, threshold=3))
+        return x
+    except Exception:
+        return img
+
+
+def _run_async_sync(coro):
+    """Run an async WinRT coroutine from a worker thread safely."""
+    try:
+        loop = asyncio.get_running_loop()
+    except Exception:
+        loop = None
+
+    if loop and loop.is_running():
+        new_loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(new_loop)
+            return new_loop.run_until_complete(coro)
+        finally:
+            try:
+                new_loop.close()
+            except Exception:
+                pass
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
+
+    return asyncio.run(coro)
+
+
+def _windows_ocr_available() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        importlib.import_module("winsdk.windows.media.ocr")
+        importlib.import_module("winsdk.windows.graphics.imaging")
+        importlib.import_module("winsdk.windows.storage.streams")
+        return True
+    except Exception:
+        pass
+    try:
+        importlib.import_module("winrt.windows.media.ocr")
+        importlib.import_module("winrt.windows.graphics.imaging")
+        importlib.import_module("winrt.windows.storage.streams")
+        return True
+    except Exception:
+        return False
+
+
+def _windows_ocr_from_png_bytes(png_bytes: bytes) -> str:
+    """Windows OCR via WinRT (fast, no ML model downloads).
+
+    Requires either:
+      - pip install winsdk
+    or the split winrt packages:
+      - pip install winrt-Windows.Media.Ocr winrt-Windows.Graphics.Imaging winrt-Windows.Storage.Streams winrt-Windows.Globalization
+    """
+
+    async def _do() -> str:
+        try:
+            ocr_mod = importlib.import_module("winsdk.windows.media.ocr")
+            imaging_mod = importlib.import_module("winsdk.windows.graphics.imaging")
+            streams_mod = importlib.import_module("winsdk.windows.storage.streams")
+            glob_mod = importlib.import_module("winsdk.windows.globalization")
+        except Exception:
+            ocr_mod = importlib.import_module("winrt.windows.media.ocr")
+            imaging_mod = importlib.import_module("winrt.windows.graphics.imaging")
+            streams_mod = importlib.import_module("winrt.windows.storage.streams")
+            glob_mod = importlib.import_module("winrt.windows.globalization")
+
+        OcrEngine = getattr(ocr_mod, "OcrEngine")
+        BitmapDecoder = getattr(imaging_mod, "BitmapDecoder")
+        InMemoryRandomAccessStream = getattr(streams_mod, "InMemoryRandomAccessStream")
+        DataWriter = getattr(streams_mod, "DataWriter")
+        Language = getattr(glob_mod, "Language")
+
+        stream = InMemoryRandomAccessStream()
+        writer = DataWriter(stream)
+        writer.write_bytes(png_bytes)
+        await writer.store_async()
+        await writer.flush_async()
+        try:
+            writer.detach_stream()
+        except Exception:
+            pass
+
+        try:
+            stream.seek(0)
+        except Exception:
+            pass
+
+        decoder = await BitmapDecoder.create_async(stream)
+        bmp = await decoder.get_software_bitmap_async()
+
+        engine = None
+        try:
+            engine = OcrEngine.try_create_from_user_profile_languages()
+        except Exception:
+            engine = None
+        if engine is None:
+            engine = OcrEngine.try_create_from_language(Language("en"))
+
+        result = await engine.recognize_async(bmp)
+        return (getattr(result, "text", "") or "")
+
+    if os.name != "nt":
+        raise RuntimeError("Windows OCR is only available on Windows.")
+    if not png_bytes:
+        return ""
+    return str(_run_async_sync(_do()) or "").strip()
 
 
 def _get_easyocr_model_dir() -> str:
@@ -35,6 +221,103 @@ def _get_easyocr_model_dir() -> str:
         model_dir = Path.home() / ".cache" / "TxtOnScrn" / "EasyOCR"
     model_dir.mkdir(parents=True, exist_ok=True)
     return str(model_dir)
+
+
+def _get_paddleocr_model_dir() -> str:
+    """Return PaddleOCR model/cache directory.
+
+    PaddleOCR by default stores models under the user's home in `.paddleocr`.
+    We keep this helper so the app can expose "Clear OCR model cache".
+    """
+    return str(Path.home() / ".paddleocr")
+
+
+def _paddle_extract_text(ocr_result) -> list[str]:
+    """Normalize PaddleOCR output into a list of text lines."""
+    if not ocr_result:
+        return []
+
+    # PaddleOCR output shape differs across versions:
+    # - legacy: [ [ [box, (text, score)], ... ] ]
+    # - newer: list[dict] with keys like rec_text/rec_score
+    # We'll walk the structure and extract common text fields while preserving order.
+
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(s: str) -> None:
+        t = (s or "").strip()
+        if not t:
+            return
+        if t in seen:
+            return
+        seen.add(t)
+        out.append(t)
+
+    def _add_from_seq(seq) -> None:
+        """Add text from common Paddle/PaddleX shapes.
+
+        Handles:
+        - ["text", 0.98] / ("text", 0.98)
+        - ["line1", "line2", ...]
+        """
+        if not isinstance(seq, (list, tuple)):
+            return
+        if not seq:
+            return
+        # (text, score)
+        if len(seq) == 2 and isinstance(seq[0], str) and isinstance(seq[1], (int, float)):
+            _add(seq[0])
+            return
+        # list[str]
+        if all(isinstance(x, str) for x in seq):
+            for x in seq:
+                _add(x)
+            return
+        # mixed: add any string members
+        for x in seq:
+            if isinstance(x, str):
+                _add(x)
+
+    def _walk(obj) -> None:
+        if obj is None:
+            return
+        # IMPORTANT: Do not collect arbitrary strings from the structure.
+        # Only extract from known OCR text fields/patterns; otherwise we may
+        # accidentally prepend unrelated values (e.g., config strings like
+        # 'min' / 'general').
+        if isinstance(obj, str):
+            return
+        if isinstance(obj, dict):
+            for k in ("rec_text", "rec_texts", "text", "texts", "transcription", "label"):
+                v = obj.get(k)
+                if isinstance(v, str):
+                    _add(v)
+                elif isinstance(v, (list, tuple)):
+                    _add_from_seq(v)
+            for v in obj.values():
+                # Recurse only into containers, not plain strings.
+                if isinstance(v, (dict, list, tuple)):
+                    _walk(v)
+            return
+        if isinstance(obj, (list, tuple)):
+            # Legacy tuple/list pattern: [box, (text, score)]
+            if len(obj) == 2:
+                rec = obj[1]
+                if isinstance(rec, (list, tuple)) and rec:
+                    _add_from_seq(rec)
+                if isinstance(rec, dict):
+                    for k in ("rec_text", "text"):
+                        v = rec.get(k)
+                        if isinstance(v, str):
+                            _add(v)
+            for v in obj:
+                if isinstance(v, (dict, list, tuple)):
+                    _walk(v)
+            return
+
+    _walk(ocr_result)
+    return out
 
 
 def _get_app_data_dir() -> str:
@@ -60,6 +343,16 @@ def _ocr_worker_main() -> int:
       {"ok": true, "text": str} OR {"ok": false, "error": str}
     """
     try:
+        # PaddleOCR 3.x uses PaddleX under the hood; disable model-host checks to avoid
+        # long delays and noisy output.
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+
+        # Reduce noisy logs (Paddle/GLog).
+        os.environ.setdefault("FLAGS_log_level", "3")
+        os.environ.setdefault("GLOG_minloglevel", "3")
+
+        proto_out = sys.stdout
+
         raw_in = sys.stdin.buffer.read()
         if not raw_in:
             raise RuntimeError("Missing stdin payload")
@@ -76,7 +369,7 @@ def _ocr_worker_main() -> int:
             scale = 2
         scale = max(1, min(scale, 4))
 
-        # EasyOCR may print progress bars; avoid encoding crashes on some Windows setups.
+        # Avoid encoding crashes on some Windows setups.
         try:
             if hasattr(sys.stdout, "reconfigure"):
                 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -87,14 +380,24 @@ def _ocr_worker_main() -> int:
 
         np = importlib.import_module("numpy")
         pil_image = importlib.import_module("PIL.Image")
-        easyocr = importlib.import_module("easyocr")
 
-        model_dir = _get_easyocr_model_dir()
-        reader = easyocr.Reader(
-            ["cs", "en"],
-            gpu=False,
-            model_storage_directory=model_dir,
-            verbose=False,
+        # Redirect any library prints away from stdout (stdout is reserved for JSON).
+        try:
+            sys.stdout = sys.stderr
+        except Exception:
+            pass
+
+        paddleocr_mod = importlib.import_module("paddleocr")
+        PaddleOCR = getattr(paddleocr_mod, "PaddleOCR")
+
+        # PaddleOCR 3.x pipeline: disable heavy document-preprocess (unwarping etc.)
+        # to keep OCR in seconds, not minutes.
+        ocr = PaddleOCR(
+            lang="en",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_det_limit_side_len=960,
         )
 
         if png_b64:
@@ -105,37 +408,43 @@ def _ocr_worker_main() -> int:
                 raise RuntimeError("Missing image input")
             img = pil_image.open(str(image_path))
 
-        # Mild upscale helps small UI fonts; configurable for speed vs accuracy
-        img = img.resize((img.size[0] * scale, img.size[1] * scale))
-        img = img.convert("RGB")
+        # Adaptive resize: keep small-font help, but cap huge selections for speed.
+        img = _prepare_image_for_ocr(img, scale=scale, use_greedy=use_greedy)
         img_arr = np.array(img)
 
-        if use_greedy:
-            parts = reader.readtext(img_arr, detail=0, paragraph=True, decoder="greedy")
-        else:
-            parts = reader.readtext(img_arr, detail=0, paragraph=True)
-
-        out_text = "\n".join([p.strip() for p in parts if isinstance(p, str) and p.strip()]).strip()
-        sys.stdout.write(json.dumps({"ok": True, "text": out_text}, ensure_ascii=False))
+        # PaddleOCR expects BGR arrays (OpenCV-like)
+        img_bgr = img_arr[:, :, ::-1]
+        result = ocr.ocr(img_bgr)
+        parts = _paddle_extract_text(result)
+        out_text = "\n".join([p for p in parts if p]).strip()
+        proto_out.write(json.dumps({"ok": True, "text": out_text}, ensure_ascii=False))
         return 0
     except ImportError:
-        sys.stdout.write(
+        proto_out.write(
             json.dumps(
                 {
                     "ok": False,
-                    "error": "OCR Libraries Missing: python library 'easyocr' is missing. Please run: pip install easyocr",
+                    "error": "OCR Libraries Missing: missing 'paddleocr'/'paddlepaddle'. Please run: pip install paddlepaddle paddleocr",
                 },
                 ensure_ascii=False,
             )
         )
+        try:
+            proto_out.flush()
+        except Exception:
+            pass
         return 2
     except Exception as e:
-        sys.stdout.write(
+        proto_out.write(
             json.dumps(
                 {"ok": False, "error": f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"},
                 ensure_ascii=False,
             )
         )
+        try:
+            proto_out.flush()
+        except Exception:
+            pass
         return 1
 
 
@@ -143,9 +452,28 @@ def _ocr_server_main() -> int:
     """Long-lived OCR process.
 
     Reads one JSON object per line from stdin and writes one JSON object per line to stdout.
-    Caches EasyOCR Reader in-process so subsequent requests are fast.
+    Caches OCR engine in-process so subsequent requests are fast.
     """
     try:
+        # PaddleOCR 3.x uses PaddleX under the hood; disable model-host checks to avoid
+        # long delays and noisy output.
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+
+        # Paddle 3.x on Windows can hit oneDNN/PIR execution-path issues (and/or become
+        # extremely slow) in some environments. Disabling MKLDNN/oneDNN is a pragmatic
+        # compatibility win for OCR.
+        os.environ.setdefault("FLAGS_use_mkldnn", "0")
+
+        # The observed crash is in PIR->runtime attribute conversion. Force legacy executor paths.
+        os.environ.setdefault("FLAGS_enable_pir_in_executor", "0")
+        os.environ.setdefault("FLAGS_enable_pir_api", "0")
+
+        # Reduce noisy logs (Paddle/GLog).
+        os.environ.setdefault("FLAGS_log_level", "3")
+        os.environ.setdefault("GLOG_minloglevel", "3")
+
+        proto_out = sys.stdout
+
         # Avoid noisy warnings interfering with protocols
         try:
             if hasattr(sys.stdout, "reconfigure"):
@@ -155,17 +483,26 @@ def _ocr_server_main() -> int:
         except Exception:
             pass
 
+        # Redirect any library prints away from stdout (stdout is reserved for JSON).
+        try:
+            sys.stdout = sys.stderr
+        except Exception:
+            pass
+
         np = importlib.import_module("numpy")
         pil_image = importlib.import_module("PIL.Image")
-        easyocr = importlib.import_module("easyocr")
 
-        model_dir = _get_easyocr_model_dir()
-        reader = easyocr.Reader(
-            ["cs", "en"],
-            gpu=False,
-            model_storage_directory=model_dir,
-            verbose=False,
-        )
+        # Handshake: let the parent process know the server started.
+        # OCR engine initialization is lazy on first request.
+        proto_out.write(json.dumps({"ok": True, "ready": True}, ensure_ascii=False) + "\n")
+        proto_out.flush()
+
+        ocr_fast = None
+        ocr_full = None
+
+        def _pil_to_bgr(pil_img):
+            arr = np.array(pil_img)
+            return arr[:, :, ::-1]
 
         for line in sys.stdin:
             line = (line or "").strip()
@@ -193,42 +530,77 @@ def _ocr_server_main() -> int:
                         raise RuntimeError("Missing image input")
                     img = pil_image.open(str(image_path))
 
-                # Mild upscale helps small UI fonts; configurable for speed vs accuracy
-                img = img.resize((img.size[0] * scale, img.size[1] * scale))
-                img = img.convert("RGB")
-                img_arr = np.array(img)
+                # Adaptive resize: keep small-font help, but cap huge selections for speed.
+                img = _prepare_image_for_ocr(img, scale=scale, use_greedy=use_greedy)
+                img_bgr = _pil_to_bgr(img)
 
-                if use_greedy:
-                    parts = reader.readtext(img_arr, detail=0, paragraph=True, decoder="greedy")
-                else:
-                    parts = reader.readtext(img_arr, detail=0, paragraph=True)
+                # Lazy init PaddleOCR to avoid slow startup / model downloads blocking READY.
+                if ocr_fast is None or ocr_full is None:
+                    paddleocr_mod = importlib.import_module("paddleocr")
+                    PaddleOCR = getattr(paddleocr_mod, "PaddleOCR")
+                    # Fast: smaller detector input.
+                    ocr_fast = PaddleOCR(
+                        lang="en",
+                        use_doc_orientation_classify=False,
+                        use_doc_unwarping=False,
+                        use_textline_orientation=False,
+                        text_det_limit_side_len=960,
+                    )
+                    # Full: slightly larger detector input (still capped by our image prep).
+                    ocr_full = PaddleOCR(
+                        lang="en",
+                        use_doc_orientation_classify=False,
+                        use_doc_unwarping=False,
+                        use_textline_orientation=False,
+                        text_det_limit_side_len=1280,
+                    )
 
-                out_text = "\n".join([p.strip() for p in parts if isinstance(p, str) and p.strip()]).strip()
-                sys.stdout.write(json.dumps({"ok": True, "text": out_text}, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
+                ocr = ocr_fast if use_greedy else ocr_full
+                result = ocr.ocr(img_bgr)
+                parts = _paddle_extract_text(result)
+                out_text = "\n".join([p for p in parts if p]).strip()
+
+                # If fast mode returns nothing, retry once with the more accurate OCR.
+                if use_greedy and not out_text and ocr_full is not None:
+                    result2 = ocr_full.ocr(img_bgr)
+                    parts2 = _paddle_extract_text(result2)
+                    out_text = "\n".join([p for p in parts2 if p]).strip()
+
+                # If still nothing, try a cheap preprocessing pass and retry with full mode.
+                if not out_text and ocr_full is not None:
+                    img2 = _light_ocr_preprocess(img)
+                    img_bgr2 = _pil_to_bgr(img2)
+                    result3 = ocr_full.ocr(img_bgr2)
+                    parts3 = _paddle_extract_text(result3)
+                    out_text = "\n".join([p for p in parts3 if p]).strip()
+                proto_out.write(json.dumps({"ok": True, "text": out_text}, ensure_ascii=False) + "\n")
+                proto_out.flush()
             except Exception as e:
-                sys.stdout.write(
+                proto_out.write(
                     json.dumps(
                         {"ok": False, "error": f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"},
                         ensure_ascii=False,
                     )
                     + "\n"
                 )
-                sys.stdout.flush()
+                proto_out.flush()
 
         return 0
     except ImportError:
-        sys.stdout.write(
+        proto_out.write(
             json.dumps(
                 {
                     "ok": False,
-                    "error": "OCR Libraries Missing: python library 'easyocr' is missing. Please run: pip install easyocr",
+                    "error": "OCR Libraries Missing: missing 'paddleocr'/'paddlepaddle'. Please run: pip install paddlepaddle paddleocr",
                 },
                 ensure_ascii=False,
             )
             + "\n"
         )
-        sys.stdout.flush()
+        try:
+            proto_out.flush()
+        except Exception:
+            pass
         return 2
     except Exception:
         # Last-resort: don't print huge tracebacks that might break protocol consumers.
@@ -267,12 +639,14 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QMessageBox,
     QProgressDialog,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTabWidget,
     QSizePolicy,
     QSplitter,
     QSystemTrayIcon,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -288,7 +662,8 @@ class _OcrWorker(QObject):
 
     def __init__(self):
         super().__init__()
-        self._reader = None
+        self._ocr_fast = None
+        self._ocr_full = None
 
     def run(self, payload) -> None:
         try:
@@ -303,8 +678,7 @@ class _OcrWorker(QObject):
             else:
                 image_path = str(payload)
 
-            # EasyOCR prints a download progress bar on first run.
-            # On some Windows setups stdout is cp1250 and can't encode block characters (\u2588).
+            # Some Windows setups have non-UTF8 stdout; avoid encoding crashes.
             try:
                 if hasattr(sys.stdout, "reconfigure"):
                     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -315,16 +689,24 @@ class _OcrWorker(QObject):
 
             np = importlib.import_module("numpy")
             pil_image = importlib.import_module("PIL.Image")
-            easyocr = importlib.import_module("easyocr")
+            paddleocr_mod = importlib.import_module("paddleocr")
+            PaddleOCR = getattr(paddleocr_mod, "PaddleOCR")
 
-            # Lazy-init and cache the reader within this worker thread (heavy)
-            if self._reader is None:
-                model_dir = _get_easyocr_model_dir()
-                self._reader = easyocr.Reader(
-                    ["cs", "en"],
-                    gpu=False,
-                    model_storage_directory=model_dir,
-                    verbose=False,
+            # Lazy-init and cache PaddleOCR instances within this worker thread (heavy)
+            if self._ocr_fast is None or self._ocr_full is None:
+                self._ocr_fast = PaddleOCR(
+                    lang="en",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    text_det_limit_side_len=960,
+                )
+                self._ocr_full = PaddleOCR(
+                    lang="en",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    text_det_limit_side_len=1280,
                 )
 
             if png_bytes is not None:
@@ -333,20 +715,19 @@ class _OcrWorker(QObject):
                 if not image_path:
                     raise RuntimeError("Missing image input")
                 img = pil_image.open(image_path)
-            # Mild upscale helps small UI fonts
+            # Adaptive resize: keep small-font help, but cap huge selections for speed.
             scale = 2
-            img = img.resize((img.size[0] * scale, img.size[1] * scale))
-            img = img.convert("RGB")
+            img = _prepare_image_for_ocr(img, scale=scale, use_greedy=use_greedy)
             img_arr = np.array(img)
 
-            if use_greedy:
-                parts = self._reader.readtext(img_arr, detail=0, paragraph=True, decoder="greedy")
-            else:
-                parts = self._reader.readtext(img_arr, detail=0, paragraph=True)
-            out_text = "\n".join([p.strip() for p in parts if isinstance(p, str) and p.strip()]).strip()
+            img_bgr = img_arr[:, :, ::-1]
+            ocr = self._ocr_fast if use_greedy else self._ocr_full
+            result = ocr.ocr(img_bgr)
+            parts = _paddle_extract_text(result)
+            out_text = "\n".join([p for p in parts if p]).strip()
             self.finished.emit(out_text)
         except ImportError:
-            self.error.emit("OCR Libraries Missing: python library 'easyocr' is missing. Please run: pip install easyocr")
+            self.error.emit("OCR Libraries Missing: missing 'paddleocr'/'paddlepaddle'. Please run: pip install paddlepaddle paddleocr")
         except Exception as e:
             self.error.emit(f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}")
 
@@ -358,31 +739,120 @@ class _OcrSubprocessWorker(QObject):
     def __init__(self):
         super().__init__()
         self._proc = None
+        self._ready = False
+
+    def _read_json_line(self, max_lines: int = 200):
+        if not self._proc or not self._proc.stdout:
+            raise RuntimeError("OCR server stdout is not available")
+        non_json: list[str] = []
+        for _ in range(max_lines):
+            line = self._proc.stdout.readline()
+            if not line:
+                break
+            s = (line or "").strip()
+            if not s:
+                continue
+            try:
+                return json.loads(s)
+            except Exception:
+                # PaddleOCR (or deps) may print non-JSON to stdout. Skip it.
+                if len(non_json) < 8:
+                    non_json.append(s[:300])
+                continue
+        msg = "OCR server returned no valid JSON"
+        if non_json:
+            msg += "\n\nServer stdout (non-JSON):\n" + "\n".join(non_json)
+        raise RuntimeError(msg)
+
+    def _read_json_line_with_timeout(self, timeout_s: float, max_lines: int = 200):
+        result = {}
+        error = {}
+
+        def _target():
+            try:
+                result["resp"] = self._read_json_line(max_lines=max_lines)
+            except Exception as e:
+                error["exc"] = e
+
+        t = threading.Thread(target=_target, daemon=True)
+        t.start()
+        t.join(timeout_s)
+
+        if t.is_alive():
+            tail = self._proc_error_tail()
+            self.shutdown()
+            msg = f"OCR timeout after {timeout_s:.0f}s. PaddleOCR initialization/inference is stuck or extremely slow in this environment."
+            if tail:
+                msg += "\n\nServer stderr:\n" + tail
+            raise TimeoutError(msg)
+
+        if "exc" in error:
+            raise error["exc"]
+        return result.get("resp")
+
+    def _proc_error_tail(self, max_chars: int = 4000) -> str:
+        proc = self._proc
+        if not proc:
+            return ""
+        if proc.poll() is None:
+            return ""
+        try:
+            if proc.stderr:
+                data = proc.stderr.read()
+                data = (data or "")[-max_chars:]
+                return data.strip()
+        except Exception:
+            return ""
+        return ""
 
     def _ensure_proc(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
+
+        self._ready = False
 
         if getattr(sys, "frozen", False):
             cmd = [sys.executable, "--ocr-server"]
         else:
             cmd = [sys.executable, os.path.abspath(__file__), "--ocr-server"]
 
-        # stderr is suppressed to keep stdout strictly as JSON lines.
+        env = os.environ.copy()
+        env.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+        env.setdefault("FLAGS_use_mkldnn", "0")
+        env.setdefault("FLAGS_enable_pir_in_executor", "0")
+        env.setdefault("FLAGS_enable_pir_api", "0")
+        env.setdefault("PYTHONWARNINGS", "ignore")
+
+        # stderr is captured so we can show crashes; stdout is reserved for JSON lines.
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=env,
         )
+
+        # Wait for READY handshake (blocks in worker thread, OK).
+        try:
+            resp = self._read_json_line(max_lines=50)
+            if isinstance(resp, dict) and resp.get("ok") is True and resp.get("ready") is True:
+                self._ready = True
+                return
+            if isinstance(resp, dict) and resp.get("ok") is False and resp.get("error"):
+                raise RuntimeError(str(resp.get("error")))
+            raise RuntimeError("OCR server did not send READY")
+        except Exception as e:
+            tail = self._proc_error_tail()
+            raise RuntimeError(str(e) + ("\n\nServer stderr:\n" + tail if tail else ""))
 
     def shutdown(self) -> None:
         proc = self._proc
         self._proc = None
+        self._ready = False
         if not proc:
             return
         try:
@@ -413,26 +883,88 @@ class _OcrSubprocessWorker(QObject):
             self._ensure_proc()
             if not self._proc or self._proc.poll() is not None:
                 raise RuntimeError("OCR server process is not running")
+            if not self._ready:
+                raise RuntimeError("OCR server is not ready")
 
             line = json.dumps(req, ensure_ascii=False)
             assert self._proc.stdin is not None
             assert self._proc.stdout is not None
-            self._proc.stdin.write(line + "\n")
-            self._proc.stdin.flush()
 
-            out_line = self._proc.stdout.readline()
-            if not out_line:
-                raise RuntimeError("OCR server returned no output")
+            try:
+                self._proc.stdin.write(line + "\n")
+                self._proc.stdin.flush()
+            except BrokenPipeError:
+                # Server died; restart once and retry.
+                tail = self._proc_error_tail()
+                self.shutdown()
+                self._ensure_proc()
+                if not self._proc or self._proc.poll() is not None or not self._proc.stdin:
+                    raise RuntimeError("OCR server crashed" + ("\n\nServer stderr:\n" + tail if tail else ""))
+                self._proc.stdin.write(line + "\n")
+                self._proc.stdin.flush()
 
-            resp = json.loads(out_line.strip())
+            timeout_s = 60.0 if req.get("use_greedy") else 120.0
+            resp = self._read_json_line_with_timeout(timeout_s=timeout_s, max_lines=50)
             if isinstance(resp, dict) and resp.get("ok") is True:
                 self.finished.emit(str(resp.get("text") or ""))
                 return
 
             if isinstance(resp, dict):
-                self.error.emit(str(resp.get("error") or "OCR failed"))
+                msg = str(resp.get("error") or "OCR failed")
+                tail = self._proc_error_tail()
+                if tail:
+                    msg += "\n\nServer stderr:\n" + tail
+                self.error.emit(msg)
             else:
                 self.error.emit("OCR failed: invalid response")
+        except Exception as e:
+            self.error.emit(f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}")
+
+
+class _WindowsOcrWorker(QObject):
+    finished = Signal(str)
+    error = Signal(str)
+
+    def run(self, payload) -> None:
+        try:
+            if os.name != "nt":
+                raise RuntimeError("Windows OCR is only available on Windows")
+            if not isinstance(payload, dict):
+                raise RuntimeError("Invalid OCR payload")
+
+            png_b64 = payload.get("png_b64")
+            image_path = payload.get("image_path")
+            use_greedy = bool(payload.get("use_greedy", True))
+            try:
+                scale = int(payload.get("scale", 1) or 1)
+            except Exception:
+                scale = 1
+            scale = max(1, min(scale, 4))
+
+            pil_image = importlib.import_module("PIL.Image")
+
+            if png_b64:
+                raw = base64.b64decode(str(png_b64).encode("ascii"), validate=False)
+                img = pil_image.open(io.BytesIO(raw))
+            else:
+                if not image_path:
+                    raise RuntimeError("Missing image input")
+                img = pil_image.open(str(image_path))
+
+            img = _prepare_image_for_ocr(img, scale=scale, use_greedy=use_greedy)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+
+            out_text = _windows_ocr_from_png_bytes(buf.getvalue())
+            self.finished.emit((out_text or "").strip())
+        except ImportError:
+            self.error.emit(
+                "Windows OCR needs WinRT Python bindings. Install one of these:\n"
+                "- pip install winsdk\n"
+                "  (recommended)\n"
+                "or\n"
+                "- pip install winrt-Windows.Media.Ocr winrt-Windows.Graphics.Imaging winrt-Windows.Storage.Streams winrt-Windows.Globalization"
+            )
         except Exception as e:
             self.error.emit(f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}")
 
@@ -482,11 +1014,13 @@ SETTINGS_AI_LMSTUDIO_ENABLED = "ai_provider_lmstudio_enabled"
 SETTINGS_AI_LOCALAI_ENABLED = "ai_provider_localai_enabled"
 
 SETTINGS_ASSISTANT_SELECTED = "assistant_selected"  # e.g. "local" or "public:groq"
+SETTINGS_ASSISTANT_ANSWER_MD = "assistant_answer_md"  # bool: render/save answers as Markdown
 
 SETTINGS_OCR_USE_GREEDY = "ocr_use_greedy"  # faster, slightly less accurate
 SETTINGS_OCR_IN_MEMORY = "ocr_in_memory"  # avoid temp file I/O
 SETTINGS_OCR_SCALE = "ocr_scale"  # int: 1..4 (speed vs accuracy)
 SETTINGS_OCR_SCALE_AUTO = "ocr_scale_auto"  # bool
+SETTINGS_OCR_ENGINE = "ocr_engine"  # "windows" | "paddle"
 SETTINGS_OCR_AUTO_RUN = "ocr_auto_run"  # bool: run OCR automatically after capture
 SETTINGS_OCR_ASSISTANT_AFTER_CAPTURE = "ocr_assistant_after_capture"  # bool: open Assistant instead of Editor
 
@@ -718,6 +1252,20 @@ class ConfigTab(QWidget):
 
         ocr_group = QGroupBox("OCR")
         ocr_layout = QVBoxLayout(ocr_group)
+
+        ocr_engine_row = QHBoxLayout()
+        ocr_engine_row.addWidget(QLabel("Engine:"))
+        self.ocr_engine_combo = QComboBox()
+        self.ocr_engine_combo.addItem("Windows OCR (fast)", "windows")
+        self.ocr_engine_combo.addItem("PaddleOCR (models)", "paddle")
+        self.ocr_engine_combo.setToolTip(
+            "Windows OCR uses built-in Windows text recognition (very fast).\n"
+            "PaddleOCR uses ML models (can be slower / needs downloads)."
+        )
+        self.ocr_engine_combo.currentIndexChanged.connect(self._on_ocr_engine_changed)
+        ocr_engine_row.addWidget(self.ocr_engine_combo, 1)
+        ocr_layout.addLayout(ocr_engine_row)
+
         self.ocr_greedy_cb = QCheckBox("Fast mode (greedy decoder)")
         self.ocr_in_memory_cb = QCheckBox("Use in-memory image (avoid temp file)")
         self.ocr_greedy_cb.toggled.connect(lambda checked: self.settings.setValue(SETTINGS_OCR_USE_GREEDY, bool(checked)))
@@ -729,7 +1277,11 @@ class ConfigTab(QWidget):
         ocr_scale_row.addWidget(QLabel("Image upscale (1 = none):"))
         self.ocr_scale_spin = QSpinBox()
         self.ocr_scale_spin.setRange(1, 4)
-        self.ocr_scale_spin.setToolTip("1 = no upscale (fastest). Higher = more accurate on small fonts, but slower. 2 is a good default.")
+        self.ocr_scale_spin.setToolTip(
+            "1 = no upscale (fastest). Higher can help small fonts, but is slower.\n"
+            "Tip: keep 'Automatic' ON for best speed.\n"
+            "Large selections are capped internally so OCR doesn't take minutes."
+        )
         self.ocr_scale_spin.valueChanged.connect(lambda v: self.settings.setValue(SETTINGS_OCR_SCALE, int(v)))
         ocr_scale_row.addWidget(self.ocr_scale_spin)
         ocr_scale_row.addWidget(QLabel("(1=none/fast, 2=default, 3-4=slower)"))
@@ -750,8 +1302,8 @@ class ConfigTab(QWidget):
         )
         ocr_layout.addWidget(self.ocr_assistant_after_capture_cb)
 
-        self.ocr_clear_cache_btn = QPushButton("Clear OCR model cache")
-        self.ocr_clear_cache_btn.setToolTip("Deletes cached EasyOCR model files from disk. They will be re-downloaded on next OCR use.")
+        self.ocr_clear_cache_btn = QPushButton("Clear PaddleOCR model cache")
+        self.ocr_clear_cache_btn.setToolTip("Deletes cached PaddleOCR model files from disk. They will be re-downloaded on next OCR use.")
         self.ocr_clear_cache_btn.clicked.connect(self._on_clear_ocr_cache_clicked)
         ocr_layout.addWidget(self.ocr_clear_cache_btn)
 
@@ -778,23 +1330,34 @@ class ConfigTab(QWidget):
         self.hotkey_label.setText(hotkey)
 
         self.ocr_greedy_cb.blockSignals(True)
-        self.ocr_greedy_cb.setChecked(bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, False, type=bool)))
+        self.ocr_greedy_cb.setChecked(bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, True, type=bool)))
         self.ocr_greedy_cb.blockSignals(False)
+
+        default_engine = "windows" if _windows_ocr_available() else "paddle"
+        engine = str(self.settings.value(SETTINGS_OCR_ENGINE, default_engine) or default_engine).strip().lower()
+        if engine not in ("windows", "paddle"):
+            engine = default_engine
+        self.ocr_engine_combo.blockSignals(True)
+        idx = self.ocr_engine_combo.findData(engine)
+        if idx >= 0:
+            self.ocr_engine_combo.setCurrentIndex(idx)
+        self.ocr_engine_combo.blockSignals(False)
+        self._apply_ocr_engine_ui(engine)
 
         self.ocr_in_memory_cb.blockSignals(True)
         self.ocr_in_memory_cb.setChecked(bool(self.settings.value(SETTINGS_OCR_IN_MEMORY, False, type=bool)))
         self.ocr_in_memory_cb.blockSignals(False)
 
         try:
-            scale = int(self.settings.value(SETTINGS_OCR_SCALE, 2) or 2)
+            scale = int(self.settings.value(SETTINGS_OCR_SCALE, 1) or 1)
         except Exception:
-            scale = 2
+            scale = 1
         scale = max(1, min(scale, 4))
         self.ocr_scale_spin.blockSignals(True)
         self.ocr_scale_spin.setValue(scale)
         self.ocr_scale_spin.blockSignals(False)
 
-        auto = bool(self.settings.value(SETTINGS_OCR_SCALE_AUTO, False, type=bool))
+        auto = bool(self.settings.value(SETTINGS_OCR_SCALE_AUTO, True, type=bool))
         self.ocr_scale_auto_cb.blockSignals(True)
         self.ocr_scale_auto_cb.setChecked(auto)
         self.ocr_scale_auto_cb.blockSignals(False)
@@ -810,16 +1373,49 @@ class ConfigTab(QWidget):
         )
         self.ocr_assistant_after_capture_cb.blockSignals(False)
 
+    def _on_ocr_engine_changed(self, *_args) -> None:
+        engine = str(self.ocr_engine_combo.currentData() or "paddle").strip().lower()
+        if engine not in ("windows", "paddle"):
+            engine = "paddle"
+
+        if engine == "windows" and not _windows_ocr_available():
+            QMessageBox.information(
+                self,
+                "Windows OCR",
+                "Windows OCR requires WinRT Python bindings.\n\n"
+                "Recommended:\n"
+                "- pip install winsdk\n\n"
+                "After installing, restart the app.",
+            )
+        self.settings.setValue(SETTINGS_OCR_ENGINE, engine)
+        self._apply_ocr_engine_ui(engine)
+
+    def _apply_ocr_engine_ui(self, engine: str) -> None:
+        engine = str(engine or "paddle").strip().lower()
+        is_windows = engine == "windows"
+
+        # Greedy decoder is Paddle-specific.
+        try:
+            self.ocr_greedy_cb.setEnabled(not is_windows)
+        except Exception:
+            pass
+
+        # Paddle cache is irrelevant for Windows OCR.
+        try:
+            self.ocr_clear_cache_btn.setEnabled(not is_windows)
+        except Exception:
+            pass
+
     def _on_ocr_scale_auto_toggled(self, checked: bool) -> None:
         self.settings.setValue(SETTINGS_OCR_SCALE_AUTO, bool(checked))
         self.ocr_scale_spin.setEnabled(not bool(checked))
 
     def _on_clear_ocr_cache_clicked(self) -> None:
-        model_dir = _get_easyocr_model_dir()
+        model_dir = _get_paddleocr_model_dir()
         answer = QMessageBox.question(
             self,
-            "Clear OCR cache",
-            "This will delete cached EasyOCR model files from disk.\n"
+            "Clear PaddleOCR cache",
+            "This will delete cached PaddleOCR model files from disk.\n"
             "OCR will download them again the next time you run OCR.\n\n"
             f"Folder:\n{model_dir}\n\n"
             "Continue?",
@@ -833,18 +1429,18 @@ class ConfigTab(QWidget):
             if os.path.isdir(model_dir):
                 shutil.rmtree(model_dir, ignore_errors=False)
             Path(model_dir).mkdir(parents=True, exist_ok=True)
-            QMessageBox.information(self, "Clear OCR cache", "OCR cache cleared.")
+            QMessageBox.information(self, "Clear PaddleOCR cache", "PaddleOCR cache cleared.")
         except Exception as e:
             QMessageBox.warning(
                 self,
-                "Clear OCR cache",
+                "Clear PaddleOCR cache",
                 "Could not clear OCR cache. If OCR is currently running, close OCR windows and try again.\n\n"
                 f"Error: {e}",
             )
 
     def _on_uninstall_clicked(self) -> None:
         app_dir = _get_app_data_dir()
-        model_dir = _get_easyocr_model_dir()
+        model_dir = _get_paddleocr_model_dir()
 
         answer = QMessageBox.question(
             self,
@@ -1057,6 +1653,20 @@ class SettingsDialog(QDialog):
 
         ai_layout.addWidget(local_group)
         ai_layout.addWidget(public_group)
+
+        assistant_group = QGroupBox("Assistant")
+        assistant_layout = QVBoxLayout(assistant_group)
+        self.assistant_answer_md_cb = QCheckBox("Answer in Markdown (.md) and open as output")
+        self.assistant_answer_md_cb.setToolTip(
+            "When enabled, Assistant output is saved to a .md file and opened.\n"
+            "The output box also renders Markdown when supported by Qt."
+        )
+        self.assistant_answer_md_cb.toggled.connect(
+            lambda checked: self.settings.setValue(SETTINGS_ASSISTANT_ANSWER_MD, bool(checked))
+        )
+        assistant_layout.addWidget(self.assistant_answer_md_cb)
+        ai_layout.addWidget(assistant_group)
+
         ai_layout.addStretch()
         self._add_tab(ai_tab, "AI")
 
@@ -1125,6 +1735,11 @@ class SettingsDialog(QDialog):
             self.ai_pub_gemini_cb.blockSignals(False)
 
         self._refresh_public_key_ui()
+
+        if hasattr(self, "assistant_answer_md_cb"):
+            self.assistant_answer_md_cb.blockSignals(True)
+            self.assistant_answer_md_cb.setChecked(bool(self.settings.value(SETTINGS_ASSISTANT_ANSWER_MD, False, type=bool)))
+            self.assistant_answer_md_cb.blockSignals(False)
 
     def on_ai_get_key_clicked(self) -> None:
         provider = self._get_selected_public_provider()
@@ -1401,6 +2016,86 @@ class HotkeySignal(QObject):
     hotkey_pressed = Signal()
 
 
+class MarkdownPreviewDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._file_path: str | None = None
+
+        self.setWindowTitle("Markdown Output")
+        self.setWindowIcon(QIcon(resource_path("ico.ico")))
+        self.resize(760, 560)
+
+        layout = QVBoxLayout(self)
+
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(True)
+        layout.addWidget(self.browser, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        self.copy_btn = QPushButton("Copy Markdown")
+        self.copy_btn.clicked.connect(self._copy_clicked)
+        btn_row.addWidget(self.copy_btn)
+
+        self.open_external_btn = QPushButton("Open .md externally")
+        self.open_external_btn.clicked.connect(self._open_external_clicked)
+        btn_row.addWidget(self.open_external_btn)
+
+        self.save_as_btn = QPushButton("Save As…")
+        self.save_as_btn.clicked.connect(self._save_as_clicked)
+        btn_row.addWidget(self.save_as_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+
+        layout.addLayout(btn_row)
+
+    def set_markdown(self, md_text: str, file_path: str | None = None) -> None:
+        self._file_path = file_path
+        s = str(md_text or "")
+        try:
+            if hasattr(self.browser, "setMarkdown"):
+                self.browser.setMarkdown(s)
+            else:
+                # Fallback: show as plain text
+                self.browser.setPlainText(s)
+        except Exception:
+            self.browser.setPlainText(s)
+
+    def _copy_clicked(self) -> None:
+        try:
+            QApplication.clipboard().setText(self.browser.toPlainText())
+        except Exception:
+            pass
+
+    def _open_external_clicked(self) -> None:
+        if not self._file_path:
+            return
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._file_path))
+        except Exception:
+            pass
+
+    def _save_as_clicked(self) -> None:
+        default_name = "assistant_output.md"
+        if self._file_path:
+            try:
+                default_name = os.path.basename(self._file_path)
+            except Exception:
+                default_name = "assistant_output.md"
+
+        path, _flt = QFileDialog.getSaveFileName(self, "Save Markdown", default_name, "Markdown (*.md);;All Files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self.browser.toPlainText())
+        except Exception as e:
+            QMessageBox.warning(self, "Save", f"Could not save: {e}")
+
+
 class AssistantDialog(QDialog):
     def __init__(self, mode: str, get_editor_text, set_editor_text=None, open_settings=None, parent=None):
         super().__init__(parent)
@@ -1415,7 +2110,68 @@ class AssistantDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        # Assistant selection + settings shortcut
+        # Menu bar (like Editor)
+        self.menu_bar = QMenuBar()
+        layout.addWidget(self.menu_bar)
+
+        self.menu_input = self.menu_bar.addMenu("Input")
+        self.menu_output = self.menu_bar.addMenu("Output")
+        self.menu_assistant = self.menu_bar.addMenu("Assistant")
+
+        copy_input_label = "Copy editor text" if callable(self.set_editor_text) else "Copy OCR text"
+        self.act_copy_input = QAction(copy_input_label, self)
+        self.act_copy_input.setShortcut(QKeySequence("Ctrl+Shift+I"))
+        self.act_copy_input.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.act_copy_input.triggered.connect(self._copy_input_clicked)
+        self.menu_input.addAction(self.act_copy_input)
+
+        self.act_copy_output = QAction("Copy output", self)
+        # Don't steal Ctrl+C from text fields; use Ctrl+Shift+C.
+        self.act_copy_output.setShortcut(QKeySequence("Ctrl+Shift+C"))
+        self.act_copy_output.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.act_copy_output.triggered.connect(lambda: QApplication.clipboard().setText(self._current_output_plain_text()))
+        self.menu_output.addAction(self.act_copy_output)
+
+        self.menu_output.addSeparator()
+        self.act_open_md = QAction("Open .md", self)
+        self.act_open_md.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        self.act_open_md.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.act_open_md.triggered.connect(self._open_last_md_external)
+        self.menu_output.addAction(self.act_open_md)
+
+        self.act_save_md_as = QAction("Save output as…", self)
+        self.act_save_md_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.act_save_md_as.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.act_save_md_as.triggered.connect(self._save_last_md_as)
+        self.menu_output.addAction(self.act_save_md_as)
+
+        self.act_settings = QAction("Settings…", self)
+        self.act_settings.setShortcut(QKeySequence("Ctrl+,"))
+        self.act_settings.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.act_settings.triggered.connect(self._open_settings_clicked)
+        self.menu_assistant.addAction(self.act_settings)
+
+        self.act_help = QAction("Help", self)
+        self.act_help.setShortcut(QKeySequence("F1"))
+        self.act_help.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.act_help.triggered.connect(self._help_clicked)
+        self.menu_assistant.addAction(self.act_help)
+
+        self.menu_assistant.addSeparator()
+        self.act_run = QAction("Run", self)
+        self.act_run.setShortcut(QKeySequence("Ctrl+Return"))
+        self.act_run.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.act_run.triggered.connect(self.on_run)
+        self.menu_assistant.addAction(self.act_run)
+
+        self.menu_assistant.addSeparator()
+        self.act_close = QAction("Close", self)
+        self.act_close.setShortcut(QKeySequence("Ctrl+W"))
+        self.act_close.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.act_close.triggered.connect(self.close)
+        self.menu_assistant.addAction(self.act_close)
+
+        # Assistant selection
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel("Assistant:"))
         self.assistant_combo = QComboBox()
@@ -1425,14 +2181,6 @@ class AssistantDialog(QDialog):
         self.assistant_combo.addItem("Public (Gemini)", "public:gemini")
         self.assistant_combo.currentIndexChanged.connect(self._on_assistant_changed)
         top_row.addWidget(self.assistant_combo, 1)
-
-        settings_btn = QPushButton("Settings…")
-        settings_btn.clicked.connect(self._open_settings_clicked)
-        top_row.addWidget(settings_btn)
-
-        help_btn = QPushButton("Help")
-        help_btn.clicked.connect(self._help_clicked)
-        top_row.addWidget(help_btn)
         layout.addLayout(top_row)
 
         layout.addWidget(QLabel("Enter task/question (can be unrelated to text)."))
@@ -1442,22 +2190,36 @@ class AssistantDialog(QDialog):
         self.task_edit.installEventFilter(self)
         layout.addWidget(self.task_edit, 1)
 
-        layout.addWidget(QLabel("Output:"))
-        self.output_edit = QTextEdit()
-        self.output_edit.setReadOnly(True)
-        layout.addWidget(self.output_edit, 2)
+        out_header = QHBoxLayout()
+        out_header.addWidget(QLabel("Output:"))
+        out_header.addStretch()
+        self.output_status_label = QLabel("")
+        out_header.addWidget(self.output_status_label)
+        layout.addLayout(out_header)
+
+        self.output_busy = QProgressBar()
+        self.output_busy.setRange(0, 0)  # indeterminate
+        self.output_busy.setTextVisible(False)
+        self.output_busy.setVisible(False)
+        layout.addWidget(self.output_busy)
+
+        self.output_text = QTextEdit()
+        self.output_text.setReadOnly(True)
+        layout.addWidget(self.output_text, 2)
+
+        self.output_md = QTextBrowser()
+        self.output_md.setOpenExternalLinks(True)
+        self.output_md.setVisible(False)
+        layout.addWidget(self.output_md, 2)
+
+        self._last_md_path: str | None = None
+        self._sync_output_mode()
 
         self._set_initial_assistant_selection()
         self._on_assistant_changed()
 
         buttons = QHBoxLayout()
         buttons.addStretch()
-
-        copy_label = "Copy editor text" if callable(self.set_editor_text) else "Copy OCR text"
-        self.copy_input_btn = QPushButton(copy_label)
-        self.copy_input_btn.clicked.connect(self._copy_input_clicked)
-        buttons.addWidget(self.copy_input_btn)
-
         self.apply_btn = QPushButton("Apply to editor")
         self.apply_btn.setEnabled(callable(self.set_editor_text))
         self.apply_btn.clicked.connect(self._apply_to_editor_clicked)
@@ -1492,7 +2254,7 @@ class AssistantDialog(QDialog):
             QMessageBox.information(self, "Apply", "Editor is not available.")
             return
 
-        text = (self.output_edit.toPlainText() or "").strip()
+        text = (self._current_output_plain_text() or "").strip()
         if not text:
             QMessageBox.information(self, "Apply", "No output to apply.")
             return
@@ -1519,6 +2281,7 @@ class AssistantDialog(QDialog):
             QMessageBox.warning(self, "Copy", f"Could not copy to clipboard: {e}")
 
     def on_run(self):
+        self._sync_output_mode()
         task = (self.task_edit.toPlainText() or "").strip()
         editor_text = ""
         try:
@@ -1527,7 +2290,7 @@ class AssistantDialog(QDialog):
             editor_text = ""
 
         if not task:
-            self.output_edit.setPlainText("Please enter a task/question.")
+            self._set_output("Please enter a task/question.")
             return
 
         mode, provider = self._get_selected_assistant()
@@ -1538,17 +2301,20 @@ class AssistantDialog(QDialog):
         # Local Assistant: simple offline text operations (no external APIs)
         text = (editor_text or "").strip()
         if not text:
-            self.output_edit.setPlainText(
+            self._set_output(
                 "Editor text is empty.\n\n"
                 "Tip: First paste text into the editor, then try e.g.: 'Summarize into 5 points'."
             )
             return
 
         try:
+            self._set_busy(True, "Working…")
             result = self._run_local(task=task, text=text)
         except Exception as e:
             result = f"Local assistant error: {e}"
-        self.output_edit.setPlainText(result)
+        finally:
+            self._set_busy(False)
+        self._set_output(result)
 
     def _set_initial_assistant_selection(self) -> None:
         settings = QSettings(ORG_NAME, APP_NAME)
@@ -1607,9 +2373,111 @@ class AssistantDialog(QDialog):
     def _help_clicked(self) -> None:
         mode, provider = self._get_selected_assistant()
         if mode == "local":
-            self.output_edit.setPlainText(self._local_help_text())
+            self._set_output(self._local_help_text())
             return
-        self.output_edit.setPlainText(self._public_help_text(provider))
+        self._set_output(self._public_help_text(provider))
+
+    def _assistant_answer_md_enabled(self) -> bool:
+        try:
+            settings = QSettings(ORG_NAME, APP_NAME)
+            return bool(settings.value(SETTINGS_ASSISTANT_ANSWER_MD, False, type=bool))
+        except Exception:
+            return False
+
+    def _write_and_open_md_output(self, md_text: str) -> None:
+        # Keep a persistent .md on disk.
+        try:
+            app_dir = _get_app_data_dir()
+            Path(app_dir).mkdir(parents=True, exist_ok=True)
+            out_path = str(Path(app_dir) / "assistant_output.md")
+            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(md_text or "")
+            self._last_md_path = out_path
+        except Exception:
+            # Non-fatal: we still show output in the UI.
+            pass
+        finally:
+            self._refresh_output_action_buttons()
+
+    def _refresh_output_action_buttons(self) -> None:
+        md = self._assistant_answer_md_enabled()
+        has_file = bool(self._last_md_path)
+        try:
+            if hasattr(self, "act_open_md"):
+                self.act_open_md.setEnabled(md and has_file)
+            if hasattr(self, "act_save_md_as"):
+                self.act_save_md_as.setEnabled(md)
+        except Exception:
+            pass
+
+    def _sync_output_mode(self) -> None:
+        md = self._assistant_answer_md_enabled()
+        try:
+            self.output_md.setVisible(md)
+            self.output_text.setVisible(not md)
+        except Exception:
+            pass
+        self._refresh_output_action_buttons()
+
+    def _set_busy(self, busy: bool, message: str = "") -> None:
+        try:
+            self.output_busy.setVisible(bool(busy))
+            self.output_status_label.setText(message if busy else "")
+            self.run_btn.setEnabled(not bool(busy))
+            self.task_edit.setEnabled(not bool(busy))
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    def _current_output_plain_text(self) -> str:
+        try:
+            if self._assistant_answer_md_enabled():
+                return self.output_md.toPlainText() or ""
+            return self.output_text.toPlainText() or ""
+        except Exception:
+            return ""
+
+    def _open_last_md_external(self) -> None:
+        if not self._last_md_path:
+            return
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._last_md_path))
+        except Exception:
+            pass
+
+    def _save_last_md_as(self) -> None:
+        default_name = "assistant_output.md"
+        if self._last_md_path:
+            try:
+                default_name = os.path.basename(self._last_md_path)
+            except Exception:
+                default_name = "assistant_output.md"
+
+        path, _flt = QFileDialog.getSaveFileName(self, "Save Markdown", default_name, "Markdown (*.md);;All Files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self._current_output_plain_text())
+        except Exception as e:
+            QMessageBox.warning(self, "Save", f"Could not save: {e}")
+
+    def _set_output(self, text: str) -> None:
+        s = str(text or "")
+        self._sync_output_mode()
+        if self._assistant_answer_md_enabled():
+            self._write_and_open_md_output(s)
+            # Prefer rendered Markdown when available.
+            try:
+                if hasattr(self.output_md, "setMarkdown"):
+                    self.output_md.setMarkdown(s)
+                else:
+                    self.output_md.setPlainText(s)
+            except Exception:
+                self.output_md.setPlainText(s)
+            return
+
+        self.output_text.setPlainText(s)
 
     @staticmethod
     def _public_help_text(provider: str | None) -> str:
@@ -1927,7 +2795,7 @@ class AssistantDialog(QDialog):
         provider = (provider_override or "").strip().lower() or self._get_selected_public_provider(settings)
         
         if not provider:
-            self.output_edit.setPlainText("No public AI provider selected.")
+            self._set_output("No public AI provider selected.")
             return
 
         api_key = ""
@@ -1941,11 +2809,11 @@ class AssistantDialog(QDialog):
             encrypted = str(settings.value(SETTINGS_AI_PUBLIC_GEMINI_API_KEY, "") or "")
             api_key = _dpapi_decrypt_from_b64(encrypted).strip()
         else:
-            self.output_edit.setPlainText("No supported public AI provider selected.")
+            self._set_output("No supported public AI provider selected.")
             return
 
         if not api_key:
-            self.output_edit.setPlainText(
+            self._set_output(
                 f"Missing API key for {provider}.\n"
                 "Go to Settings -> AI -> Public and enter the API key."
             )
@@ -1954,8 +2822,7 @@ class AssistantDialog(QDialog):
         prompt = self._build_public_prompt(task=task, editor_text=editor_text)
 
         self.setCursor(Qt.WaitCursor)
-        self.task_edit.setEnabled(False)
-        QApplication.processEvents()
+        self._set_busy(True, "Generating…")
         try:
             answer = ""
             if provider == "groq":
@@ -1967,11 +2834,11 @@ class AssistantDialog(QDialog):
             else:
                 answer = f"Provider '{provider}' is not fully implemented yet."
 
-            self.output_edit.setPlainText(self._clean_public_answer(answer))
+            self._set_output(self._clean_public_answer(answer))
         except Exception as e:
-            self.output_edit.setPlainText(f"Public AI error: {e}")
+            self._set_output(f"Public AI error: {e}")
         finally:
-            self.task_edit.setEnabled(True)
+            self._set_busy(False)
             self.setCursor(Qt.ArrowCursor)
 
     def _get_selected_public_provider(self, settings: QSettings):
@@ -2373,6 +3240,102 @@ class _OcrOnceController(QObject):
             pass
 
 
+class OcrService(QObject):
+    """Single shared OCR service for the whole app.
+
+    PaddleOCR 3.x cold start can take minutes (imports + model init). If we start a new OCR server
+    per capture/window, the user experiences "minutes" every time. This service keeps exactly one
+    long-lived OCR server process and reuses it across Editor/Assistant flows.
+
+    Requests are serialized (one at a time) via a small FIFO queue.
+    """
+
+    _request_signal = Signal(object)
+    _request_windows_signal = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thread = QThread(self)
+        self._paddle_worker = _OcrSubprocessWorker()
+        self._paddle_worker.moveToThread(self._thread)
+        self._request_signal.connect(self._paddle_worker.run)
+        self._paddle_worker.finished.connect(self._on_finished)
+        self._paddle_worker.error.connect(self._on_error)
+
+        self._windows_worker = _WindowsOcrWorker()
+        self._windows_worker.moveToThread(self._thread)
+        self._request_windows_signal.connect(self._windows_worker.run)
+        self._windows_worker.finished.connect(self._on_finished)
+        self._windows_worker.error.connect(self._on_error)
+        self._thread.start()
+
+        self._busy = False
+        self._queue: list[tuple[dict, object, object]] = []
+        self._current_ok = None
+        self._current_err = None
+
+    def submit(self, payload: dict, on_ok, on_err) -> None:
+        if not isinstance(payload, dict):
+            try:
+                on_err("OCR Error: Invalid payload")
+            except Exception:
+                pass
+            return
+
+        self._queue.append((payload, on_ok, on_err))
+        self._pump()
+
+    def _pump(self) -> None:
+        if self._busy:
+            return
+        if not self._queue:
+            return
+        payload, on_ok, on_err = self._queue.pop(0)
+        self._busy = True
+        self._current_ok = on_ok
+        self._current_err = on_err
+
+        engine = str((payload.get("engine") if isinstance(payload, dict) else "") or "paddle").strip().lower()
+        if engine == "windows":
+            self._request_windows_signal.emit(payload)
+        else:
+            self._request_signal.emit(payload)
+
+    def _on_finished(self, text: str) -> None:
+        cb = self._current_ok
+        self._busy = False
+        self._current_ok = None
+        self._current_err = None
+        try:
+            if callable(cb):
+                cb(text)
+        finally:
+            self._pump()
+
+    def _on_error(self, message: str) -> None:
+        cb = self._current_err
+        self._busy = False
+        self._current_ok = None
+        self._current_err = None
+        try:
+            if callable(cb):
+                cb(message)
+        finally:
+            self._pump()
+
+    def shutdown(self) -> None:
+        try:
+            self._paddle_worker.shutdown()
+        except Exception:
+            pass
+        try:
+            if self._thread.isRunning():
+                self._thread.quit()
+                self._thread.wait(1500)
+        except Exception:
+            pass
+
+
 class OcrAssistantFlow(QObject):
     """Capture -> OCR -> open Assistant (skip EditorWindow UI)."""
 
@@ -2391,12 +3354,13 @@ class OcrAssistantFlow(QObject):
             open_settings=lambda: self.tray_app.show_settings("general"),
             parent=None,
         )
-        self.dialog.output_edit.setPlainText("Running OCR…")
+        try:
+            self.dialog._set_output("Running OCR…")
+        except Exception:
+            pass
         self.dialog.set_run_enabled(False)
 
-        self._ocr = _OcrOnceController()
-        self._ocr.finished.connect(self._on_ocr_finished)
-        self._ocr.error.connect(self._on_ocr_error)
+        self._ocr_service = getattr(self.tray_app, "ocr_service", None)
         self.dialog.destroyed.connect(lambda *_: self.shutdown())
 
     def show(self) -> None:
@@ -2410,12 +3374,7 @@ class OcrAssistantFlow(QObject):
         QTimer.singleShot(0, self.start_ocr)
 
     def shutdown(self) -> None:
-        try:
-            if getattr(self, "_ocr", None) is not None:
-                self._ocr.shutdown()
-        except Exception:
-            pass
-        self._ocr = None
+        self._ocr_service = None
         self._cleanup_temp()
 
     def _cleanup_temp(self) -> None:
@@ -2428,11 +3387,11 @@ class OcrAssistantFlow(QObject):
                 pass
 
     def _compute_ocr_scale(self) -> int:
-        use_auto_scale = bool(self.settings.value(SETTINGS_OCR_SCALE_AUTO, False, type=bool))
+        use_auto_scale = bool(self.settings.value(SETTINGS_OCR_SCALE_AUTO, True, type=bool))
         try:
-            scale = int(self.settings.value(SETTINGS_OCR_SCALE, 2) or 2)
+            scale = int(self.settings.value(SETTINGS_OCR_SCALE, 1) or 1)
         except Exception:
-            scale = 2
+            scale = 1
 
         if use_auto_scale:
             try:
@@ -2455,16 +3414,22 @@ class OcrAssistantFlow(QObject):
     def start_ocr(self) -> None:
         # Always auto-run OCR in this flow.
         try:
-            self.dialog.output_edit.setPlainText("Running OCR…")
+            self.dialog._set_output("Running OCR…")
             self.dialog.set_run_enabled(False)
         except Exception:
             pass
 
         use_in_memory = bool(self.settings.value(SETTINGS_OCR_IN_MEMORY, False, type=bool))
-        use_greedy = bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, False, type=bool))
+        use_greedy = bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, True, type=bool))
         scale = self._compute_ocr_scale()
 
+        default_engine = "windows" if _windows_ocr_available() else "paddle"
+        engine = str(self.settings.value(SETTINGS_OCR_ENGINE, default_engine) or default_engine).strip().lower()
+        if engine not in ("windows", "paddle"):
+            engine = default_engine
+
         payload = {
+            "engine": engine,
             "use_greedy": use_greedy,
             "image_path": None,
             "png_b64": None,
@@ -2491,16 +3456,20 @@ class OcrAssistantFlow(QObject):
                 return
             payload["image_path"] = self._temp_path
 
-        self._ocr.ocr_request.emit(payload)
+        svc = self._ocr_service
+        if svc is None:
+            self._on_ocr_error("OCR Error: OCR service is not available.")
+            return
+        svc.submit(payload, self._on_ocr_finished, self._on_ocr_error)
 
     def _on_ocr_finished(self, out_text: str) -> None:
         self._source_text = (out_text or "").strip()
         self._cleanup_temp()
 
         if self._source_text:
-            self.dialog.output_edit.setPlainText("OCR ready. Enter task and press Run.")
+            self.dialog._set_output("OCR ready. Enter task and press Run.")
         else:
-            self.dialog.output_edit.setPlainText("OCR finished: no text detected. You can still ask a question.")
+            self.dialog._set_output("OCR finished: no text detected. You can still ask a question.")
 
         self.dialog.set_run_enabled(True)
         try:
@@ -2511,7 +3480,7 @@ class OcrAssistantFlow(QObject):
     def _on_ocr_error(self, message: str) -> None:
         self._cleanup_temp()
         self._source_text = ""
-        self.dialog.output_edit.setPlainText(str(message or "OCR failed"))
+        self.dialog._set_output(str(message or "OCR failed"))
         # Still allow using Assistant for unrelated questions.
         self.dialog.set_run_enabled(True)
         try:
@@ -2521,9 +3490,7 @@ class OcrAssistantFlow(QObject):
 
 
 class EditorWindow(QWidget):
-    ocr_request = Signal(object)
     enhance_request = Signal(str)
-    ocr_shutdown = Signal()
 
     def __init__(self, pixmap: QPixmap, tray_app=None, parent=None):
         super().__init__(parent)
@@ -2648,15 +3615,13 @@ class EditorWindow(QWidget):
 
         self._assistant_dialog = None
 
-        # OCR worker thread (runs OCR in a separate process to avoid keeping Torch/EasyOCR RAM in the tray process)
-        self._ocr_thread = QThread(self)
-        self._ocr_worker = _OcrSubprocessWorker()
-        self._ocr_worker.moveToThread(self._ocr_thread)
-        self.ocr_request.connect(self._ocr_worker.run)
-        self.ocr_shutdown.connect(self._ocr_worker.shutdown)
-        self._ocr_worker.finished.connect(self._on_ocr_finished)
-        self._ocr_worker.error.connect(self._on_ocr_error)
-        self._ocr_thread.start()
+        # OCR service: prefer shared tray-level service to avoid cold-start on each new Editor window.
+        self._ocr_service = None
+        if self.tray_app is not None and getattr(self.tray_app, "ocr_service", None) is not None:
+            self._ocr_service = self.tray_app.ocr_service
+        else:
+            # Fallback for standalone EditorWindow usage
+            self._ocr_service = OcrService(parent=self)
 
         self._ocr_progress = None
         self._ocr_temp_path = None
@@ -2721,16 +3686,13 @@ class EditorWindow(QWidget):
     def closeEvent(self, event):
         # Save splitter state
         self.settings.setValue("editor_splitter_state", self.splitter.saveState())
+        # Only shutdown local service (shared TrayApp service must stay alive).
         try:
-            if hasattr(self, "_ocr_thread") and self._ocr_thread and self._ocr_thread.isRunning():
-                try:
-                    self.ocr_shutdown.emit()
-                except Exception:
-                    pass
-                self._ocr_thread.quit()
-                self._ocr_thread.wait(1500)
+            if self._ocr_service is not None and (self.tray_app is None or getattr(self.tray_app, "ocr_service", None) is None):
+                self._ocr_service.shutdown()
         except Exception:
             pass
+        self._ocr_service = None
 
         try:
             if hasattr(self, "_enhance_thread") and self._enhance_thread and self._enhance_thread.isRunning():
@@ -2787,14 +3749,19 @@ class EditorWindow(QWidget):
         temp_path = None
         try:
             use_in_memory = bool(self.settings.value(SETTINGS_OCR_IN_MEMORY, False, type=bool))
-            use_greedy = bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, False, type=bool))
+            use_greedy = bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, True, type=bool))
 
-            use_auto_scale = bool(self.settings.value(SETTINGS_OCR_SCALE_AUTO, False, type=bool))
+            default_engine = "windows" if _windows_ocr_available() else "paddle"
+            engine = str(self.settings.value(SETTINGS_OCR_ENGINE, default_engine) or default_engine).strip().lower()
+            if engine not in ("windows", "paddle"):
+                engine = default_engine
+
+            use_auto_scale = bool(self.settings.value(SETTINGS_OCR_SCALE_AUTO, True, type=bool))
 
             try:
-                scale = int(self.settings.value(SETTINGS_OCR_SCALE, 2) or 2)
+                scale = int(self.settings.value(SETTINGS_OCR_SCALE, 1) or 1)
             except Exception:
-                scale = 2
+                scale = 1
 
             if use_auto_scale:
                 # Simple heuristic: larger selections benefit from speed (lower scale),
@@ -2817,6 +3784,7 @@ class EditorWindow(QWidget):
             scale = max(1, min(scale, 4))
 
             payload = {
+                "engine": engine,
                 "use_greedy": use_greedy,
                 "image_path": None,
                 "png_b64": None,
@@ -2856,7 +3824,12 @@ class EditorWindow(QWidget):
             self._ocr_progress = dlg
 
             # Kick off OCR in worker thread
-            self.ocr_request.emit(payload)
+            svc = self._ocr_service
+            if svc is None:
+                self.text_edit.append("OCR Error: OCR service is not available.")
+                self._cleanup_ocr_ui_and_temp()
+                return
+            svc.submit(payload, self._on_ocr_finished, self._on_ocr_error)
         except Exception as e:
             error_msg = f"OCR Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             self.text_edit.append(error_msg)
@@ -3270,6 +4243,9 @@ class TrayApp:
         self.editor_window = None
         self.ocr_assistant_flow = None
 
+        # Shared OCR service (single long-lived OCR subprocess for the whole app)
+        self.ocr_service = OcrService(parent=self.app)
+
         # Apply appearance theme early
         apply_theme_mode(self.settings.value(SETTINGS_THEME_MODE, "system"))
 
@@ -3452,6 +4428,15 @@ class TrayApp:
             except Exception:
                 pass
             self.editor_window = None
+
+        # Stop shared OCR subprocess
+        try:
+            if getattr(self, "ocr_service", None) is not None:
+                self.ocr_service.shutdown()
+        except Exception:
+            pass
+        self.ocr_service = None
+
         if self.current_hotkey:
             try:
                 keyboard.remove_hotkey(self.current_hotkey)
@@ -3462,7 +4447,10 @@ class TrayApp:
         if hasattr(self, 'shared_memory'):
             self.shared_memory.detach()
         self.tray_icon.hide()
-        QApplication.quit()
+        try:
+            self.app.quit()
+        except Exception:
+            QApplication.quit()
 
     def run(self):
         sys.exit(self.app.exec())

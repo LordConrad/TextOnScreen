@@ -8,7 +8,10 @@ def _collect_pkgs(*names):
     binaries = []
     hiddenimports = []
     for n in names:
-        d, b, h = collect_all(n)
+        try:
+            d, b, h = collect_all(n)
+        except Exception:
+            continue
         datas += d
         binaries += b
         hiddenimports += h
@@ -16,9 +19,11 @@ def _collect_pkgs(*names):
 
 
 extra_datas, extra_binaries, extra_hiddenimports = _collect_pkgs(
-    "easyocr",
-    "torch",
-    "torchvision",
+    "paddleocr",
+    "paddle",
+    # Optional: Windows OCR bindings (WinRT)
+    "winsdk",
+    "winrt",
 )
 
 
