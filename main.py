@@ -204,6 +204,120 @@ def _windows_ocr_from_png_bytes(png_bytes: bytes) -> str:
     return str(_run_async_sync(_do()) or "").strip()
 
 
+def _windows_ocr_from_png_bytes_detail(png_bytes: bytes) -> dict:
+    """Windows OCR via WinRT returning word boxes.
+
+    Returns: {"text": str, "items": [{"text": str, "box": [[x,y],...], "score": float}, ...]}
+    Box coordinates are in the pixel space of the provided PNG.
+    """
+
+    async def _do() -> dict:
+        try:
+            ocr_mod = importlib.import_module("winsdk.windows.media.ocr")
+            imaging_mod = importlib.import_module("winsdk.windows.graphics.imaging")
+            streams_mod = importlib.import_module("winsdk.windows.storage.streams")
+            glob_mod = importlib.import_module("winsdk.windows.globalization")
+        except Exception:
+            ocr_mod = importlib.import_module("winrt.windows.media.ocr")
+            imaging_mod = importlib.import_module("winrt.windows.graphics.imaging")
+            streams_mod = importlib.import_module("winrt.windows.storage.streams")
+            glob_mod = importlib.import_module("winrt.windows.globalization")
+
+        OcrEngine = getattr(ocr_mod, "OcrEngine")
+        BitmapDecoder = getattr(imaging_mod, "BitmapDecoder")
+        InMemoryRandomAccessStream = getattr(streams_mod, "InMemoryRandomAccessStream")
+        DataWriter = getattr(streams_mod, "DataWriter")
+        Language = getattr(glob_mod, "Language")
+
+        stream = InMemoryRandomAccessStream()
+        writer = DataWriter(stream)
+        writer.write_bytes(png_bytes)
+        await writer.store_async()
+        await writer.flush_async()
+        try:
+            writer.detach_stream()
+        except Exception:
+            pass
+
+        try:
+            stream.seek(0)
+        except Exception:
+            pass
+
+        decoder = await BitmapDecoder.create_async(stream)
+        bmp = await decoder.get_software_bitmap_async()
+
+        engine = None
+        try:
+            engine = OcrEngine.try_create_from_user_profile_languages()
+        except Exception:
+            engine = None
+        if engine is None:
+            engine = OcrEngine.try_create_from_language(Language("en"))
+
+        result = await engine.recognize_async(bmp)
+        text = str(getattr(result, "text", "") or "")
+
+        items: list[dict] = []
+
+        def _rect_to_box(rect) -> list[list[float]] | None:
+            if rect is None:
+                return None
+            try:
+                x = float(getattr(rect, "x"))
+                y = float(getattr(rect, "y"))
+                w = float(getattr(rect, "width"))
+                h = float(getattr(rect, "height"))
+            except Exception:
+                return None
+            if w <= 0 or h <= 0:
+                return None
+            return [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+
+        try:
+            lines = getattr(result, "lines", None) or []
+        except Exception:
+            lines = []
+
+        for ln in lines:
+            try:
+                words = getattr(ln, "words", None) or []
+            except Exception:
+                words = []
+            for w in words:
+                try:
+                    wt = str(getattr(w, "text", "") or "").strip()
+                except Exception:
+                    wt = ""
+                if not wt:
+                    continue
+                rect = None
+                try:
+                    rect = getattr(w, "bounding_rect", None)
+                except Exception:
+                    rect = None
+                if rect is None:
+                    try:
+                        rect = getattr(w, "boundingRect", None)
+                    except Exception:
+                        rect = None
+                box = _rect_to_box(rect)
+                if not box:
+                    continue
+                items.append({"text": wt, "box": box, "score": 1.0})
+
+        return {"text": text, "items": items}
+
+    if os.name != "nt":
+        raise RuntimeError("Windows OCR is only available on Windows.")
+    if not png_bytes:
+        return {"text": "", "items": []}
+    out = _run_async_sync(_do())
+    if isinstance(out, dict):
+        return out
+    return {"text": str(out or ""), "items": []}
+
+
 def _get_easyocr_model_dir() -> str:
     """Return a persistent per-user directory for EasyOCR model files."""
     # Windows: use LOCALAPPDATA (survives reboot and temp cleanups)
@@ -318,6 +432,82 @@ def _paddle_extract_text(ocr_result) -> list[str]:
 
     _walk(ocr_result)
     return out
+
+
+def _paddle_extract_items(ocr_result) -> list[dict]:
+    """Extract OCR items with bounding boxes from PaddleOCR output.
+
+    Returns a list of dicts: {"text": str, "box": [[x,y], ...], "score": float|None}
+    Box coordinates are in the OCR input image pixel space.
+    """
+    if not ocr_result:
+        return []
+
+    items: list[dict] = []
+
+    def _norm_box(box):
+        if not box:
+            return None
+        if isinstance(box, (list, tuple)) and len(box) == 4 and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in box):
+            out = []
+            for p in box:
+                try:
+                    out.append([float(p[0]), float(p[1])])
+                except Exception:
+                    return None
+            return out
+        return None
+
+    def _add(text: str, box, score=None) -> None:
+        t = (text or "").strip()
+        b = _norm_box(box)
+        if not t or not b:
+            return
+        try:
+            sc = float(score) if score is not None else None
+        except Exception:
+            sc = None
+        items.append({"text": t, "box": b, "score": sc})
+
+    def _walk(obj) -> None:
+        # Common legacy shape:
+        # [ [ [box, (text, score)], ... ] ]
+        if isinstance(obj, (list, tuple)):
+            # [box, (text, score)]
+            if len(obj) == 2 and isinstance(obj[0], (list, tuple)):
+                box = obj[0]
+                rec = obj[1]
+                if isinstance(rec, (list, tuple)) and len(rec) >= 1:
+                    text = rec[0]
+                    score = rec[1] if len(rec) >= 2 else None
+                    if isinstance(text, str):
+                        _add(text, box, score)
+                elif isinstance(rec, dict):
+                    text = rec.get("rec_text") or rec.get("text")
+                    score = rec.get("rec_score") or rec.get("score")
+                    if isinstance(text, str):
+                        _add(text, box, score)
+
+            # Walk nested
+            for v in obj:
+                if isinstance(v, (dict, list, tuple)):
+                    _walk(v)
+            return
+
+        if isinstance(obj, dict):
+            # Newer PaddleX-ish shapes sometimes contain rec_text and polygon points
+            text = obj.get("rec_text") or obj.get("text")
+            box = obj.get("points") or obj.get("poly") or obj.get("box")
+            score = obj.get("rec_score") or obj.get("score")
+            if isinstance(text, str) and box is not None:
+                _add(text, box, score)
+            for v in obj.values():
+                if isinstance(v, (dict, list, tuple)):
+                    _walk(v)
+            return
+
+    _walk(ocr_result)
+    return items
 
 
 def _get_app_data_dir() -> str:
@@ -516,6 +706,7 @@ def _ocr_server_main() -> int:
                 image_path = payload.get("image_path")
                 png_b64 = payload.get("png_b64")
                 use_greedy = bool(payload.get("use_greedy", False))
+                return_boxes = bool(payload.get("return_boxes", False))
                 try:
                     scale = int(payload.get("scale", 2) or 2)
                 except Exception:
@@ -530,8 +721,17 @@ def _ocr_server_main() -> int:
                         raise RuntimeError("Missing image input")
                     img = pil_image.open(str(image_path))
 
+                try:
+                    orig_w, orig_h = int(img.size[0]), int(img.size[1])
+                except Exception:
+                    orig_w, orig_h = 0, 0
+
                 # Adaptive resize: keep small-font help, but cap huge selections for speed.
                 img = _prepare_image_for_ocr(img, scale=scale, use_greedy=use_greedy)
+                try:
+                    proc_w, proc_h = int(img.size[0]), int(img.size[1])
+                except Exception:
+                    proc_w, proc_h = orig_w, orig_h
                 img_bgr = _pil_to_bgr(img)
 
                 # Lazy init PaddleOCR to avoid slow startup / model downloads blocking READY.
@@ -560,11 +760,15 @@ def _ocr_server_main() -> int:
                 parts = _paddle_extract_text(result)
                 out_text = "\n".join([p for p in parts if p]).strip()
 
+                items = _paddle_extract_items(result) if return_boxes else None
+
                 # If fast mode returns nothing, retry once with the more accurate OCR.
                 if use_greedy and not out_text and ocr_full is not None:
                     result2 = ocr_full.ocr(img_bgr)
                     parts2 = _paddle_extract_text(result2)
                     out_text = "\n".join([p for p in parts2 if p]).strip()
+                    if return_boxes:
+                        items = _paddle_extract_items(result2)
 
                 # If still nothing, try a cheap preprocessing pass and retry with full mode.
                 if not out_text and ocr_full is not None:
@@ -573,7 +777,17 @@ def _ocr_server_main() -> int:
                     result3 = ocr_full.ocr(img_bgr2)
                     parts3 = _paddle_extract_text(result3)
                     out_text = "\n".join([p for p in parts3 if p]).strip()
-                proto_out.write(json.dumps({"ok": True, "text": out_text}, ensure_ascii=False) + "\n")
+
+                    if return_boxes:
+                        items = _paddle_extract_items(result3)
+
+                resp = {"ok": True, "text": out_text}
+                if return_boxes:
+                    resp["items"] = items or []
+                    resp["orig_size"] = {"w": orig_w, "h": orig_h}
+                    resp["proc_size"] = {"w": proc_w, "h": proc_h}
+
+                proto_out.write(json.dumps(resp, ensure_ascii=False) + "\n")
                 proto_out.flush()
             except Exception as e:
                 proto_out.write(
@@ -629,6 +843,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QRadioButton,
     QColorDialog,
     QFileDialog,
     QGroupBox,
@@ -652,7 +867,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from PySide6.QtCore import Qt, QSettings, QSharedMemory, QRect, QPoint, QObject, Signal, QEvent, QUrl, QThread, QBuffer, QTimer
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QPainter, QColor, QPen, QCursor, QPixmap, QPalette, QDesktopServices
+from PySide6.QtGui import QAction, QIcon, QKeySequence, QPainter, QColor, QPen, QCursor, QPixmap, QPalette, QDesktopServices, QFont, QFontMetrics
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 
@@ -734,6 +949,7 @@ class _OcrWorker(QObject):
 
 class _OcrSubprocessWorker(QObject):
     finished = Signal(str)
+    finished_detail = Signal(object)
     error = Signal(str)
 
     def __init__(self):
@@ -870,12 +1086,17 @@ class _OcrSubprocessWorker(QObject):
             if not isinstance(payload, dict):
                 raise RuntimeError("Invalid OCR payload")
 
+            want_detail = bool(payload.get("return_boxes", False))
+
             req = {
                 "image_path": payload.get("image_path"),
                 "png_b64": payload.get("png_b64"),
                 "use_greedy": bool(payload.get("use_greedy", False)),
                 "scale": payload.get("scale", 2),
             }
+
+            if want_detail:
+                req["return_boxes"] = True
 
             if not req.get("image_path") and not req.get("png_b64"):
                 raise RuntimeError("Missing image input")
@@ -906,7 +1127,10 @@ class _OcrSubprocessWorker(QObject):
             timeout_s = 60.0 if req.get("use_greedy") else 120.0
             resp = self._read_json_line_with_timeout(timeout_s=timeout_s, max_lines=50)
             if isinstance(resp, dict) and resp.get("ok") is True:
-                self.finished.emit(str(resp.get("text") or ""))
+                if want_detail:
+                    self.finished_detail.emit(resp)
+                else:
+                    self.finished.emit(str(resp.get("text") or ""))
                 return
 
             if isinstance(resp, dict):
@@ -923,6 +1147,7 @@ class _OcrSubprocessWorker(QObject):
 
 class _WindowsOcrWorker(QObject):
     finished = Signal(str)
+    finished_detail = Signal(object)
     error = Signal(str)
 
     def run(self, payload) -> None:
@@ -951,12 +1176,35 @@ class _WindowsOcrWorker(QObject):
                     raise RuntimeError("Missing image input")
                 img = pil_image.open(str(image_path))
 
+            try:
+                orig_w, orig_h = int(img.size[0]), int(img.size[1])
+            except Exception:
+                orig_w, orig_h = 0, 0
+
             img = _prepare_image_for_ocr(img, scale=scale, use_greedy=use_greedy)
+            try:
+                proc_w, proc_h = int(img.size[0]), int(img.size[1])
+            except Exception:
+                proc_w, proc_h = orig_w, orig_h
             buf = io.BytesIO()
             img.save(buf, format="PNG")
 
-            out_text = _windows_ocr_from_png_bytes(buf.getvalue())
-            self.finished.emit((out_text or "").strip())
+            want_detail = bool(payload.get("return_boxes", False))
+            if want_detail:
+                d = _windows_ocr_from_png_bytes_detail(buf.getvalue())
+                text = str((d.get("text") if isinstance(d, dict) else "") or "").strip()
+                items = (d.get("items") if isinstance(d, dict) else None) or []
+                resp = {
+                    "ok": True,
+                    "text": text,
+                    "items": items,
+                    "orig_size": {"w": orig_w or proc_w, "h": orig_h or proc_h},
+                    "proc_size": {"w": proc_w or orig_w, "h": proc_h or orig_h},
+                }
+                self.finished_detail.emit(resp)
+            else:
+                out_text = _windows_ocr_from_png_bytes(buf.getvalue())
+                self.finished.emit((out_text or "").strip())
         except ImportError:
             self.error.emit(
                 "Windows OCR needs WinRT Python bindings. Install one of these:\n"
@@ -1004,6 +1252,16 @@ APP_NAME = "TrayConfig"
 REG_APP_NAME = "TxtOnScrn"
 SETTINGS_HOTKEY = "hotkey"
 DEFAULT_HOTKEY = "Ctrl+Shift+Y"
+
+SETTINGS_TRANSLATION_LANGUAGE = "translation_language"  # e.g. "en", "cs"
+SETTINGS_TRANSLATION_SOURCE_LANGUAGE = "translation_source_language"  # "auto" | "en" | "cs" | ...
+SETTINGS_TRANSLATION_HOTKEY = "translation_hotkey"
+SETTINGS_TRANSLATION_ENGINE = "translation_engine"  # "argos" (offline) | "public" (online)
+SETTINGS_TRANSLATION_AUTO_DOWNLOAD_MODELS = "translation_auto_download_models"  # bool
+DEFAULT_TRANSLATION_LANGUAGE = "en"
+DEFAULT_TRANSLATION_HOTKEY = "Ctrl+Shift+T"
+DEFAULT_TRANSLATION_SOURCE_LANGUAGE = "auto"
+DEFAULT_TRANSLATION_ENGINE = "argos"
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SETTINGS_THEME_MODE = "appearance_theme_mode"  # system | light | dark
 SETTINGS_SNIP_BORDER_COLOR = "appearance_snip_border_color"  # hex, e.g. #0078D7
@@ -1530,7 +1788,563 @@ class ConfigTab(QWidget):
                 self.hotkey_label.setText(new_hotkey)
                 self.settings.setValue(SETTINGS_HOTKEY, new_hotkey)
                 if self.tray_app:
-                    self.tray_app.register_hotkey()
+                    self.tray_app.register_hotkeys()
+
+
+class TranslationTab(QWidget):
+    def __init__(self, settings: QSettings, tray_app=None, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.tray_app = tray_app
+
+        lang_group = QGroupBox("Language")
+        lang_layout = QVBoxLayout(lang_group)
+
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel("Source:"))
+        self.source_combo = QComboBox()
+        self.source_combo.addItem("Auto (best effort)", "auto")
+        self.source_combo.addItem("English", "en")
+        self.source_combo.addItem("Czech (Čeština)", "cs")
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        src_row.addWidget(self.source_combo, 1)
+        lang_layout.addLayout(src_row)
+
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(QLabel("Target:"))
+        self.language_combo = QComboBox()
+        self.language_combo.addItem("English", "en")
+        self.language_combo.addItem("Czech (Čeština)", "cs")
+        self.language_combo.addItem("Slovak (Slovenčina)", "sk")
+        self.language_combo.addItem("German (Deutsch)", "de")
+        self.language_combo.addItem("French (Français)", "fr")
+        self.language_combo.addItem("Spanish (Español)", "es")
+        self.language_combo.addItem("Italian (Italiano)", "it")
+        self.language_combo.addItem("Polish (Polski)", "pl")
+        self.language_combo.addItem("Russian (Русский)", "ru")
+        self.language_combo.currentIndexChanged.connect(self._on_language_changed)
+        lang_row.addWidget(self.language_combo, 1)
+        lang_layout.addLayout(lang_row)
+
+        engine_group = QGroupBox("Engine")
+        engine_layout = QVBoxLayout(engine_group)
+        self.engine_offline_rb = QRadioButton("Offline (Argos Translate, open-source)")
+        self.engine_public_rb = QRadioButton("Online (Public AI provider)")
+        self.engine_offline_rb.toggled.connect(self._on_engine_changed)
+        self.engine_public_rb.toggled.connect(self._on_engine_changed)
+        engine_layout.addWidget(self.engine_offline_rb)
+        engine_layout.addWidget(self.engine_public_rb)
+
+        self.auto_models_cb = QCheckBox("Automatically download language models when missing (requires internet once)")
+        self.auto_models_cb.toggled.connect(self._on_auto_models_toggled)
+        engine_layout.addWidget(self.auto_models_cb)
+
+        hotkey_group = QGroupBox("Shortcut")
+        hotkey_layout = QVBoxLayout(hotkey_group)
+
+        self.hotkey_label = QLabel()
+        self.hotkey_change_btn = QPushButton("Change")
+        self.hotkey_change_btn.clicked.connect(self._on_change_hotkey)
+
+        hotkey_row = QHBoxLayout()
+        hotkey_row.addWidget(QLabel("Hotkey:"))
+        hotkey_row.addWidget(self.hotkey_label, 1)
+        hotkey_row.addWidget(self.hotkey_change_btn)
+        hotkey_layout.addLayout(hotkey_row)
+
+        hint = QLabel(
+            "Press the configured shortcut to open a translation overlay.\n"
+            "Workflow: shortcut → capture screen → OCR → translation overlay.\n"
+            "Tip: Offline translation uses Argos Translate models installed per language pair."
+        )
+        hint.setStyleSheet("color: rgba(0,0,0,0.65);")
+        hotkey_layout.addWidget(hint)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(lang_group)
+        layout.addWidget(engine_group)
+        layout.addWidget(hotkey_group)
+        layout.addStretch()
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        src = str(self.settings.value(SETTINGS_TRANSLATION_SOURCE_LANGUAGE, DEFAULT_TRANSLATION_SOURCE_LANGUAGE) or DEFAULT_TRANSLATION_SOURCE_LANGUAGE)
+        src_idx = self.source_combo.findData(src)
+        self.source_combo.blockSignals(True)
+        if src_idx >= 0:
+            self.source_combo.setCurrentIndex(src_idx)
+        else:
+            fallback = self.source_combo.findData(DEFAULT_TRANSLATION_SOURCE_LANGUAGE)
+            if fallback >= 0:
+                self.source_combo.setCurrentIndex(fallback)
+        self.source_combo.blockSignals(False)
+
+        lang = str(self.settings.value(SETTINGS_TRANSLATION_LANGUAGE, DEFAULT_TRANSLATION_LANGUAGE) or DEFAULT_TRANSLATION_LANGUAGE)
+        idx = self.language_combo.findData(lang)
+        self.language_combo.blockSignals(True)
+        if idx >= 0:
+            self.language_combo.setCurrentIndex(idx)
+        else:
+            # Default to English if unknown
+            fallback = self.language_combo.findData(DEFAULT_TRANSLATION_LANGUAGE)
+            if fallback >= 0:
+                self.language_combo.setCurrentIndex(fallback)
+        self.language_combo.blockSignals(False)
+
+        engine = str(self.settings.value(SETTINGS_TRANSLATION_ENGINE, DEFAULT_TRANSLATION_ENGINE) or DEFAULT_TRANSLATION_ENGINE).strip().lower()
+        if engine not in ("argos", "public"):
+            engine = DEFAULT_TRANSLATION_ENGINE
+        self.engine_offline_rb.blockSignals(True)
+        self.engine_public_rb.blockSignals(True)
+        self.engine_offline_rb.setChecked(engine == "argos")
+        self.engine_public_rb.setChecked(engine == "public")
+        self.engine_offline_rb.blockSignals(False)
+        self.engine_public_rb.blockSignals(False)
+
+        auto_models = bool(self.settings.value(SETTINGS_TRANSLATION_AUTO_DOWNLOAD_MODELS, True, type=bool))
+        self.auto_models_cb.blockSignals(True)
+        self.auto_models_cb.setChecked(auto_models)
+        self.auto_models_cb.blockSignals(False)
+        self.auto_models_cb.setEnabled(engine == "argos")
+
+        hotkey = str(self.settings.value(SETTINGS_TRANSLATION_HOTKEY, DEFAULT_TRANSLATION_HOTKEY) or DEFAULT_TRANSLATION_HOTKEY)
+        self.hotkey_label.setText(hotkey)
+
+    def _on_source_changed(self, *_args) -> None:
+        src = str(self.source_combo.currentData() or DEFAULT_TRANSLATION_SOURCE_LANGUAGE)
+        self.settings.setValue(SETTINGS_TRANSLATION_SOURCE_LANGUAGE, src)
+
+    def _on_language_changed(self, *_args) -> None:
+        lang = str(self.language_combo.currentData() or DEFAULT_TRANSLATION_LANGUAGE)
+        self.settings.setValue(SETTINGS_TRANSLATION_LANGUAGE, lang)
+
+    def _on_engine_changed(self, *_args) -> None:
+        engine = "argos" if self.engine_offline_rb.isChecked() else "public"
+        self.settings.setValue(SETTINGS_TRANSLATION_ENGINE, engine)
+        try:
+            self.auto_models_cb.setEnabled(engine == "argos")
+        except Exception:
+            pass
+
+    def _on_auto_models_toggled(self, checked: bool) -> None:
+        self.settings.setValue(SETTINGS_TRANSLATION_AUTO_DOWNLOAD_MODELS, bool(checked))
+
+    def _on_change_hotkey(self) -> None:
+        dialog = HotkeyDialog(self.hotkey_label.text(), parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            new_hotkey = dialog.hotkey_text.strip()
+            if new_hotkey:
+                self.hotkey_label.setText(new_hotkey)
+                self.settings.setValue(SETTINGS_TRANSLATION_HOTKEY, new_hotkey)
+                if self.tray_app:
+                    self.tray_app.register_hotkeys()
+
+
+class PublicAiClient:
+    """Minimal Public AI client shared by non-UI flows (e.g. translation overlay)."""
+
+    def __init__(self):
+        self._groq_model = ""
+        self._openai_model = ""
+        self._gemini_model = ""
+
+    @staticmethod
+    def _get_selected_public_provider(settings: QSettings):
+        if bool(settings.value(SETTINGS_AI_PUBLIC_GROQ_ENABLED, False, type=bool)):
+            return "groq"
+        if bool(settings.value(SETTINGS_AI_PUBLIC_OPENAI_ENABLED, False, type=bool)):
+            return "openai"
+        if bool(settings.value(SETTINGS_AI_PUBLIC_GEMINI_ENABLED, False, type=bool)):
+            return "gemini"
+        return None
+
+    @staticmethod
+    def _get_public_api_key(settings: QSettings, provider: str) -> str:
+        p = (provider or "").strip().lower()
+        if p == "groq":
+            encrypted = str(settings.value(SETTINGS_AI_PUBLIC_GROQ_API_KEY, "") or "")
+            return _dpapi_decrypt_from_b64(encrypted).strip()
+        if p == "openai":
+            encrypted = str(settings.value(SETTINGS_AI_PUBLIC_OPENAI_API_KEY, "") or "")
+            return _dpapi_decrypt_from_b64(encrypted).strip()
+        if p == "gemini":
+            encrypted = str(settings.value(SETTINGS_AI_PUBLIC_GEMINI_API_KEY, "") or "")
+            return _dpapi_decrypt_from_b64(encrypted).strip()
+        return ""
+
+    def _groq_select_model(self, api_key: str) -> str:
+        preferences = [
+            "llama-3.1-8b-instant",
+            "llama-3.1-70b-versatile",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it",
+        ]
+
+        url = "https://api.groq.com/openai/v1/models"
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return preferences[0]
+
+        try:
+            body = json.loads(raw)
+        except Exception:
+            return preferences[0]
+
+        data = body.get("data") or []
+        ids = [m.get("id") for m in data if isinstance(m, dict) and m.get("id")]
+        for pref in preferences:
+            if pref in ids:
+                return pref
+        return ids[0] if ids else preferences[0]
+
+    def _groq_generate(self, api_key: str, prompt: str) -> str:
+        model = self._groq_model or self._groq_select_model(api_key)
+        self._groq_model = model
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            raw_err = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {e.code}: {raw_err}")
+
+        body = json.loads(raw)
+        choices = body.get("choices") or []
+        if not choices:
+            raise RuntimeError("No choices in response")
+        msg = choices[0].get("message") or {}
+        content = msg.get("content") or ""
+        if not content:
+            raise RuntimeError("Empty response content")
+        return content
+
+    def _openai_generate(self, api_key: str, prompt: str) -> str:
+        model = self._openai_model or "gpt-4o-mini"
+        self._openai_model = model
+        url = "https://api.openai.com/v1/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            raw_err = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {e.code}: {raw_err}")
+
+        body = json.loads(raw)
+        choices = body.get("choices") or []
+        if not choices:
+            raise RuntimeError("No choices in response")
+        msg = choices[0].get("message") or {}
+        content = msg.get("content") or ""
+        if not content:
+            raise RuntimeError("Empty response content")
+        return content
+
+    def _gemini_generate(self, api_key: str, prompt: str) -> str:
+        model = self._gemini_model or "gemini-1.5-flash"
+        self._gemini_model = model
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{urllib.parse.quote(model)}:generateContent?key={urllib.parse.quote(api_key)}"
+        )
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2},
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=35) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            raw_err = e.read().decode("utf-8", errors="replace")
+            try:
+                body_err = json.loads(raw_err)
+            except Exception:
+                body_err = None
+            msg = None
+            if isinstance(body_err, dict):
+                err = body_err.get("error")
+                if isinstance(err, dict):
+                    msg = err.get("message")
+            raise RuntimeError(f"HTTP {e.code}: {msg or raw_err}")
+
+        body = json.loads(raw)
+        candidates = body.get("candidates") or []
+        if not candidates:
+            raise RuntimeError("No candidates in response")
+
+        content = (candidates[0].get("content") or {}) if isinstance(candidates[0], dict) else {}
+        parts = content.get("parts") or []
+        if not parts:
+            raise RuntimeError("Empty response content")
+
+        out = []
+        for p in parts:
+            if isinstance(p, dict) and p.get("text"):
+                out.append(str(p.get("text")))
+        text_out = "".join(out).strip()
+        if not text_out:
+            raise RuntimeError("Empty response text")
+        return text_out
+
+    def translate_text(self, text: str, target_lang_code: str) -> str:
+        settings = QSettings(ORG_NAME, APP_NAME)
+        provider = self._get_selected_public_provider(settings)
+        if not provider:
+            raise RuntimeError("No public AI provider selected. Configure it in Settings → AI → Public.")
+
+        api_key = self._get_public_api_key(settings, provider)
+        if not api_key:
+            raise RuntimeError("Missing API key. Configure it in Settings → AI → Public.")
+
+        lang_map = {
+            "en": "English",
+            "cs": "Czech",
+            "sk": "Slovak",
+            "de": "German",
+            "fr": "French",
+            "es": "Spanish",
+            "it": "Italian",
+            "pl": "Polish",
+            "uk": "Ukrainian",
+            "ru": "Russian",
+        }
+        target_name = lang_map.get((target_lang_code or "").strip().lower(), target_lang_code or "English")
+
+        prompt = (
+            "RULES:\n"
+            "- Output ONLY the translated text.\n"
+            "- Preserve line breaks as much as possible.\n"
+            "- Do NOT add any explanations.\n"
+            "- Do NOT wrap in quotes.\n\n"
+            f"Translate the following text to {target_name}:\n\n"
+            + (text or "")
+        )
+
+        if provider == "groq":
+            return self._groq_generate(api_key=api_key, prompt=prompt).strip()
+        if provider == "openai":
+            return self._openai_generate(api_key=api_key, prompt=prompt).strip()
+        if provider == "gemini":
+            return self._gemini_generate(api_key=api_key, prompt=prompt).strip()
+        raise RuntimeError("No supported public AI provider selected.")
+
+
+def _guess_source_language_code(text: str) -> str:
+    """Best-effort source language guess for offline translation.
+
+    Argos Translate needs an explicit source language. We keep this intentionally
+    simple: default to English unless Czech diacritics are detected.
+    """
+    s = (text or "")
+    if not s:
+        return "en"
+    lowered = s.lower()
+    cz_markers = "ěščřžýáíéůúďťňó"
+    for ch in cz_markers:
+        if ch in lowered:
+            return "cs"
+    return "en"
+
+
+class LocalArgosTranslateClient:
+    """Offline translation via Argos Translate (open-source).
+
+    Models are installed per language pair. We keep all Argos data inside
+    the app's LocalAppData folder by setting XDG/ARGOS env vars before import.
+    """
+
+    def __init__(self, base_dir: str | None = None):
+        self._base_dir = Path(base_dir or _get_app_data_dir()) / "ArgosTranslate"
+
+    def _configure_env(self) -> None:
+        # Ensure Argos Translate stores everything under our app dir.
+        data_dir = self._base_dir / "data"
+        config_dir = self._base_dir / "config"
+        cache_dir = self._base_dir / "cache"
+        packages_dir = self._base_dir / "packages"
+
+        data_dir.mkdir(parents=True, exist_ok=True)
+        config_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        packages_dir.mkdir(parents=True, exist_ok=True)
+
+        os.environ["XDG_DATA_HOME"] = str(data_dir)
+        os.environ["XDG_CONFIG_HOME"] = str(config_dir)
+        os.environ["XDG_CACHE_HOME"] = str(cache_dir)
+        os.environ["ARGOS_PACKAGES_DIR"] = str(packages_dir)
+
+        # Keep CPU as default (most users).
+        os.environ.setdefault("ARGOS_DEVICE_TYPE", "cpu")
+
+    def translate_text(self, text: str, source_lang_code: str, target_lang_code: str, auto_install: bool) -> str:
+        self._configure_env()
+
+        try:
+            import argostranslate.package as argos_package
+            import argostranslate.translate as argos_translate
+        except Exception:
+            raise RuntimeError(
+                "Offline translation requires Argos Translate.\n\n"
+                "Install: pip install argostranslate\n"
+                "Then restart the app."
+            )
+
+        src = (source_lang_code or DEFAULT_TRANSLATION_SOURCE_LANGUAGE).strip().lower()
+        dst = (target_lang_code or DEFAULT_TRANSLATION_LANGUAGE).strip().lower()
+
+        if src in ("auto", ""):
+            src = _guess_source_language_code(text)
+
+        if not text or not text.strip():
+            return ""
+        if src == dst:
+            return text.strip()
+
+        def _try_translate() -> str:
+            return str(argos_translate.translate(text, src, dst) or "").strip()
+
+        try:
+            out = _try_translate()
+            if out:
+                return out
+        except Exception:
+            pass
+
+        if not auto_install:
+            raise RuntimeError(
+                f"No offline model installed for {src} → {dst}. "
+                "Enable auto-download in Settings → Translation → Engine or install models via argospm."
+            )
+
+        # Try to install a direct model. If not available, try pivoting via English.
+        try:
+            argos_package.update_package_index()
+        except Exception:
+            # Continue; package index may already exist.
+            pass
+
+        installed = False
+        try:
+            installed = bool(argos_package.install_package_for_language_pair(src, dst))
+        except Exception:
+            installed = False
+
+        if not installed and src != "en" and dst != "en":
+            ok1 = False
+            ok2 = False
+            try:
+                ok1 = bool(argos_package.install_package_for_language_pair(src, "en"))
+            except Exception:
+                ok1 = False
+            try:
+                ok2 = bool(argos_package.install_package_for_language_pair("en", dst))
+            except Exception:
+                ok2 = False
+            installed = ok1 and ok2
+
+        if not installed:
+            raise RuntimeError(
+                f"No Argos model available to install for {src} → {dst}. "
+                "Try a different source/target language pair."
+            )
+
+        out = _try_translate()
+        if not out:
+            raise RuntimeError("Offline translation returned empty output.")
+        return out
+
+
+class _TranslateWorker(QObject):
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, text: str, target_lang: str, source_lang: str | None = None, parent=None):
+        super().__init__(parent)
+        self._text = text
+        self._target_lang = target_lang
+        self._source_lang = source_lang
+        self._public_client = PublicAiClient()
+        self._argos_client = LocalArgosTranslateClient()
+
+    def run(self) -> None:
+        try:
+            settings = QSettings(ORG_NAME, APP_NAME)
+            engine = str(settings.value(SETTINGS_TRANSLATION_ENGINE, DEFAULT_TRANSLATION_ENGINE) or DEFAULT_TRANSLATION_ENGINE).strip().lower()
+            auto_models = bool(settings.value(SETTINGS_TRANSLATION_AUTO_DOWNLOAD_MODELS, True, type=bool))
+            src = self._source_lang
+            if src is None:
+                src = str(settings.value(SETTINGS_TRANSLATION_SOURCE_LANGUAGE, DEFAULT_TRANSLATION_SOURCE_LANGUAGE) or DEFAULT_TRANSLATION_SOURCE_LANGUAGE)
+
+            if engine == "public":
+                out = self._public_client.translate_text(self._text, self._target_lang)
+            else:
+                out = self._argos_client.translate_text(
+                    text=self._text,
+                    source_lang_code=src,
+                    target_lang_code=self._target_lang,
+                    auto_install=auto_models,
+                )
+            self.finished.emit(out)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class SettingsDialog(QDialog):
@@ -1548,6 +2362,9 @@ class SettingsDialog(QDialog):
 
         config_tab = ConfigTab(settings=self.settings, tray_app=self.tray_app)
         self._add_tab(config_tab, "General")
+
+        translation_tab = TranslationTab(settings=self.settings, tray_app=self.tray_app)
+        self._add_tab(translation_tab, "Translation")
 
         appearance_tab = QWidget()
         appearance_layout = QVBoxLayout(appearance_tab)
@@ -1958,7 +2775,7 @@ class SettingsDialog(QDialog):
 
         # Refresh General tab on show (startup/hotkey may change outside)
         current = self.tabs.currentWidget()
-        if isinstance(current, ConfigTab):
+        if isinstance(current, (ConfigTab, TranslationTab)):
             current.refresh()
 
 
@@ -2014,6 +2831,7 @@ class HotkeyDialog(QDialog):
 
 class HotkeySignal(QObject):
     hotkey_pressed = Signal()
+    translate_pressed = Signal()
 
 
 class MarkdownPreviewDialog(QDialog):
@@ -3259,20 +4077,23 @@ class OcrService(QObject):
         self._paddle_worker = _OcrSubprocessWorker()
         self._paddle_worker.moveToThread(self._thread)
         self._request_signal.connect(self._paddle_worker.run)
-        self._paddle_worker.finished.connect(self._on_finished)
+        self._paddle_worker.finished.connect(self._on_finished_text)
+        self._paddle_worker.finished_detail.connect(self._on_finished_detail)
         self._paddle_worker.error.connect(self._on_error)
 
         self._windows_worker = _WindowsOcrWorker()
         self._windows_worker.moveToThread(self._thread)
         self._request_windows_signal.connect(self._windows_worker.run)
-        self._windows_worker.finished.connect(self._on_finished)
+        self._windows_worker.finished.connect(self._on_finished_text)
+        self._windows_worker.finished_detail.connect(self._on_finished_detail)
         self._windows_worker.error.connect(self._on_error)
         self._thread.start()
 
         self._busy = False
-        self._queue: list[tuple[dict, object, object]] = []
+        self._queue: list[tuple[dict, object, object, bool]] = []
         self._current_ok = None
         self._current_err = None
+        self._current_want_detail = False
 
     def submit(self, payload: dict, on_ok, on_err) -> None:
         if not isinstance(payload, dict):
@@ -3282,7 +4103,8 @@ class OcrService(QObject):
                 pass
             return
 
-        self._queue.append((payload, on_ok, on_err))
+        want_detail = bool(payload.get("return_boxes", False))
+        self._queue.append((payload, on_ok, on_err, want_detail))
         self._pump()
 
     def _pump(self) -> None:
@@ -3290,10 +4112,11 @@ class OcrService(QObject):
             return
         if not self._queue:
             return
-        payload, on_ok, on_err = self._queue.pop(0)
+        payload, on_ok, on_err, want_detail = self._queue.pop(0)
         self._busy = True
         self._current_ok = on_ok
         self._current_err = on_err
+        self._current_want_detail = bool(want_detail)
 
         engine = str((payload.get("engine") if isinstance(payload, dict) else "") or "paddle").strip().lower()
         if engine == "windows":
@@ -3301,14 +4124,27 @@ class OcrService(QObject):
         else:
             self._request_signal.emit(payload)
 
-    def _on_finished(self, text: str) -> None:
+    def _on_finished_text(self, text: str) -> None:
         cb = self._current_ok
         self._busy = False
         self._current_ok = None
         self._current_err = None
+        self._current_want_detail = False
         try:
             if callable(cb):
                 cb(text)
+        finally:
+            self._pump()
+
+    def _on_finished_detail(self, resp: object) -> None:
+        cb = self._current_ok
+        self._busy = False
+        self._current_ok = None
+        self._current_err = None
+        self._current_want_detail = False
+        try:
+            if callable(cb):
+                cb(resp)
         finally:
             self._pump()
 
@@ -3317,6 +4153,7 @@ class OcrService(QObject):
         self._busy = False
         self._current_ok = None
         self._current_err = None
+        self._current_want_detail = False
         try:
             if callable(cb):
                 cb(message)
@@ -4089,7 +4926,7 @@ class SnippingOverlay(QWidget):
                 self.update()
         event.accept()
         
-    def process_capture(self, selection_rect):
+    def process_capture(self, selection_rect, emit_signal: bool = True):
         final_fragments = []
         total_output_width = 0
         max_output_height = 0
@@ -4150,7 +4987,7 @@ class SnippingOverlay(QWidget):
                     max_output_height = max(max_output_height, src_h)
         
         if not final_fragments:
-            return
+            return None
 
         result = QPixmap(total_output_width, max_output_height)
         result.fill(Qt.transparent)
@@ -4164,7 +5001,9 @@ class SnippingOverlay(QWidget):
              current_x += frag.width()
              
         painter.end()
-        self.capture_taken.emit(result)
+        if emit_signal:
+            self.capture_taken.emit(result)
+        return result
         
     def show_fullscreen_custom(self):
         # Instead of classic showFullScreen(), which often takes only primary monitor,
@@ -4220,6 +5059,763 @@ class SnippingOverlay(QWidget):
         event.accept()
 
 
+class TranslationSnippingOverlay(SnippingOverlay):
+    """Overlay: select area → OCR → translate → render translation inside selection.
+
+    This is a pragmatic 'Google Lens-like' UX (block overlay). It does not do per-word
+    alignment or in-image reflow.
+    """
+
+    def __init__(self, tray_app, parent=None, fullscreen_auto: bool = True):
+        super().__init__(parent=parent)
+        self.tray_app = tray_app
+        self.settings = QSettings(ORG_NAME, APP_NAME)
+        self._fullscreen_auto = bool(fullscreen_auto)
+
+        if self._fullscreen_auto:
+            try:
+                self.setCursor(QCursor(Qt.ArrowCursor))
+            except Exception:
+                pass
+
+        self._locked = False
+        self._selection_rect = None
+        self._captured_pixmap = None
+
+        self._status = "Preparing…" if self._fullscreen_auto else "Select an area"
+        self._status_detail = ""
+        self._translated_text = ""
+
+        self._lens_lines = []  # list[dict]: {"band": QRect, "text": str}
+
+        # Simple loading indicator so users can tell it's working.
+        self._progress = QProgressBar(self)
+        self._progress.setRange(0, 0)  # indeterminate
+        self._progress.setTextVisible(True)
+        self._progress.setFormat("Working…")
+        self._progress.hide()
+
+        self._ocr_service = getattr(self.tray_app, "ocr_service", None)
+
+        self._ocr_engine_last = ""
+        self._ocr_fallback_tried = False
+        self._ocr_payload_last: dict | None = None
+
+        self._tx_thread = None
+        self._tx_worker = None
+
+    def _summarize_status(self, message: str) -> str:
+        s = str(message or "").replace("\r", "").strip()
+        if not s:
+            return ""
+        # Hide noisy tracebacks in the one-line UI.
+        if "Traceback:" in s:
+            s = s.split("Traceback:", 1)[0].strip()
+        # Collapse whitespace/newlines.
+        s = " ".join(s.split())
+        if len(s) > 220:
+            s = s[:220].rstrip() + "…"
+        return s
+
+    def _set_status(self, status: str, detail: str = "") -> None:
+        self._status = self._summarize_status(status) or "Working…"
+        self._status_detail = str(detail or "")
+
+    def _show_details_dialog(self, title: str, detail: str) -> None:
+        try:
+            dlg = QDialog(self)
+            dlg.setWindowTitle(title)
+            dlg.setModal(True)
+            dlg.resize(900, 520)
+
+            layout = QVBoxLayout(dlg)
+            info = QLabel("Detaily (Ctrl+C kopíruje do schránky)")
+            layout.addWidget(info)
+
+            edit = QTextEdit()
+            edit.setReadOnly(True)
+            edit.setLineWrapMode(QTextEdit.NoWrap)
+            edit.setPlainText(detail or "")
+            layout.addWidget(edit)
+
+            btns = QHBoxLayout()
+            btn_copy = QPushButton("Copy")
+            btn_close = QPushButton("Close")
+            btns.addWidget(btn_copy)
+            btns.addStretch(1)
+            btns.addWidget(btn_close)
+            layout.addLayout(btns)
+
+            def _copy():
+                try:
+                    QApplication.clipboard().setText(edit.toPlainText() or "")
+                except Exception:
+                    pass
+
+            btn_copy.clicked.connect(_copy)
+            btn_close.clicked.connect(dlg.close)
+            dlg.exec()
+        except Exception:
+            pass
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if self._locked:
+            event.accept()
+            return
+        if self._fullscreen_auto:
+            # Ignore manual selection in fullscreen-auto mode.
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self._locked:
+            event.accept()
+            return
+        if self._fullscreen_auto:
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if self._locked:
+            event.accept()
+            return
+
+        if self._fullscreen_auto:
+            event.accept()
+            return
+
+        if event.button() == Qt.LeftButton and self.is_selecting:
+            self.is_selecting = False
+            self.end_pos = event.position().toPoint()
+
+            selection_rect = QRect(self.start_pos, self.end_pos).normalized()
+            if selection_rect.width() > 10 and selection_rect.height() > 10:
+                self._selection_rect = selection_rect
+                self._captured_pixmap = self.process_capture(selection_rect, emit_signal=False)
+                if self._captured_pixmap is None or self._captured_pixmap.isNull():
+                    self.close()
+                    return
+
+                self._locked = True
+                self._status = "Running OCR…"
+                self.update()
+                QTimer.singleShot(0, self._start_ocr)
+            else:
+                self.update()
+        event.accept()
+
+    def show_fullscreen_custom(self):
+        super().show_fullscreen_custom()
+        if self._fullscreen_auto:
+            QTimer.singleShot(0, self._start_fullscreen_flow)
+
+    def resizeEvent(self, event):  # noqa: N802
+        try:
+            # Keep the progress bar centered at the top.
+            w = max(240, min(520, int(self.width() * 0.5)))
+            self._progress.setGeometry(int((self.width() - w) / 2), 16, w, 18)
+        except Exception:
+            pass
+        super().resizeEvent(event)
+
+    def _set_busy(self, busy: bool, label: str = "Working…") -> None:
+        try:
+            self._progress.setFormat(label)
+            self._progress.setVisible(bool(busy))
+        except Exception:
+            pass
+        try:
+            if self._fullscreen_auto:
+                self.setCursor(QCursor(Qt.WaitCursor if busy else Qt.ArrowCursor))
+        except Exception:
+            pass
+
+    def _start_fullscreen_flow(self) -> None:
+        if self._locked:
+            return
+
+        # Hide selection UI; we translate the whole visible desktop.
+        self.start_pos = None
+        self.end_pos = None
+        self.is_selecting = False
+
+        full_rect = self.rect()
+        if full_rect.isEmpty() or full_rect.width() < 10 or full_rect.height() < 10:
+            self._status = "Capture error: invalid screen geometry."
+            self.update()
+            return
+
+        self._selection_rect = full_rect
+        self._captured_pixmap = self.process_capture(full_rect, emit_signal=False)
+        if self._captured_pixmap is None or self._captured_pixmap.isNull():
+            self._status = "Capture error: could not capture screen."
+            self.update()
+            return
+
+        self._locked = True
+        self._ocr_fallback_tried = False
+        self._ocr_payload_last = None
+        self._ocr_engine_last = ""
+        self._set_status("Running OCR…")
+        self._set_busy(True, "OCR…")
+        self.update()
+        QTimer.singleShot(0, self._start_ocr)
+
+    def _compute_ocr_scale_for_pixmap(self, pixmap: QPixmap) -> int:
+        use_auto_scale = bool(self.settings.value(SETTINGS_OCR_SCALE_AUTO, True, type=bool))
+        try:
+            scale = int(self.settings.value(SETTINGS_OCR_SCALE, 1) or 1)
+        except Exception:
+            scale = 1
+
+        if use_auto_scale:
+            try:
+                w = int(pixmap.width())
+                h = int(pixmap.height())
+            except Exception:
+                w, h = 0, 0
+            area = w * h
+            if area <= 0:
+                scale = 2
+            elif area < 700_000:
+                scale = 3
+            elif area < 2_200_000:
+                scale = 2
+            else:
+                scale = 1
+
+        return max(1, min(int(scale), 4))
+
+    def _start_ocr(self) -> None:
+        if self._ocr_service is None:
+            self._set_status("OCR Error: OCR service is not available.")
+            self._set_busy(False)
+            self.update()
+            return
+
+        pix = self._captured_pixmap
+        if pix is None or pix.isNull():
+            self._set_status("OCR Error: Missing image.")
+            self._set_busy(False)
+            self.update()
+            return
+
+        use_greedy = bool(self.settings.value(SETTINGS_OCR_USE_GREEDY, True, type=bool))
+        scale = self._compute_ocr_scale_for_pixmap(pix)
+
+        # Translation overlay prefers fast Windows OCR when available.
+        windows_ok = _windows_ocr_available()
+        default_engine = "windows" if windows_ok else "paddle"
+        engine_setting = str(self.settings.value(SETTINGS_OCR_ENGINE, default_engine) or default_engine).strip().lower()
+        if engine_setting not in ("windows", "paddle"):
+            engine_setting = default_engine
+        engine = "windows" if windows_ok else engine_setting
+
+        self._lens_lines = []
+        self._translated_text = ""
+
+        payload = {
+            "engine": engine,
+            "use_greedy": use_greedy,
+            "image_path": None,
+            "png_b64": None,
+            "scale": scale,
+        }
+
+        # For Lens-like placement, we need bounding boxes.
+        # - PaddleOCR: yes
+        # - Windows OCR: now supports word boxes too
+        if engine in ("paddle", "windows"):
+            payload["return_boxes"] = True
+
+        self._ocr_payload_last = dict(payload)
+        self._ocr_engine_last = engine
+
+        buf = QBuffer()
+        buf.open(QBuffer.ReadWrite)
+        ok = pix.save(buf, "PNG")
+        if not ok:
+            self._set_status("OCR Error: Could not encode image.")
+            self._set_busy(False)
+            self.update()
+            return
+        payload["png_b64"] = base64.b64encode(bytes(buf.data())).decode("ascii")
+        buf.close()
+
+        # Persist payload with encoded image for possible fallback retry.
+        try:
+            self._ocr_payload_last = dict(payload)
+        except Exception:
+            self._ocr_payload_last = None
+
+        if payload.get("return_boxes"):
+            self._ocr_service.submit(payload, self._on_ocr_finished_detail, self._on_ocr_error)
+        else:
+            self._ocr_service.submit(payload, self._on_ocr_finished, self._on_ocr_error)
+
+    def _on_ocr_error(self, message: str) -> None:
+        detail = str(message or "OCR failed")
+
+        # If PaddleOCR timed out, auto-fallback to Windows OCR once (when available).
+        msg_l = detail.lower()
+        if (
+            not self._ocr_fallback_tried
+            and self._ocr_engine_last == "paddle"
+            and ("timeout" in msg_l or "stuck" in msg_l or "extremely slow" in msg_l)
+            and _windows_ocr_available()
+        ):
+            self._ocr_fallback_tried = True
+            payload = dict(self._ocr_payload_last or {})
+            payload["engine"] = "windows"
+            payload.pop("return_boxes", None)
+            self._ocr_engine_last = "windows"
+            self._set_status("PaddleOCR is slow here → retrying with Windows OCR…")
+            self._set_busy(True, "OCR (Windows)…")
+            self.update()
+            try:
+                self._ocr_service.submit(payload, self._on_ocr_finished, self._on_ocr_error)
+                return
+            except Exception:
+                # Fall through to showing the original error.
+                pass
+
+        short = self._summarize_status(detail) or "OCR failed"
+        self._set_status(f"{short} (F1 for details)", detail=detail)
+        try:
+            print(detail)
+        except Exception:
+            pass
+        self._set_busy(False)
+        self.update()
+
+    def _on_ocr_finished(self, out_text: str) -> None:
+        text = (out_text or "").strip()
+        if not text:
+            self._set_status("OCR finished: no text detected.")
+            self._set_busy(False)
+            self.update()
+            return
+
+        source_lang = str(
+            self.settings.value(SETTINGS_TRANSLATION_SOURCE_LANGUAGE, DEFAULT_TRANSLATION_SOURCE_LANGUAGE)
+            or DEFAULT_TRANSLATION_SOURCE_LANGUAGE
+        )
+        target_lang = str(
+            self.settings.value(SETTINGS_TRANSLATION_LANGUAGE, DEFAULT_TRANSLATION_LANGUAGE)
+            or DEFAULT_TRANSLATION_LANGUAGE
+        )
+
+        engine = str(
+            self.settings.value(SETTINGS_TRANSLATION_ENGINE, DEFAULT_TRANSLATION_ENGINE)
+            or DEFAULT_TRANSLATION_ENGINE
+        ).strip().lower()
+
+        self._set_status("Translating (offline)…" if engine != "public" else "Translating (online)…")
+        self._set_busy(True, "Translating…")
+        self.update()
+
+        try:
+            self._tx_thread = QThread(self)
+            self._tx_worker = _TranslateWorker(text=text, target_lang=target_lang, source_lang=source_lang)
+            self._tx_worker.moveToThread(self._tx_thread)
+            self._tx_thread.started.connect(self._tx_worker.run)
+            self._tx_worker.finished.connect(self._on_translate_finished)
+            self._tx_worker.error.connect(self._on_translate_error)
+            self._tx_worker.finished.connect(lambda *_: self._cleanup_translate_thread())
+            self._tx_worker.error.connect(lambda *_: self._cleanup_translate_thread())
+            self._tx_thread.start()
+        except Exception as e:
+            detail = f"Translate error: {e}\n\nTraceback:\n{traceback.format_exc()}"
+            self._set_status("Translate error (F1 for details)", detail=detail)
+            self.update()
+
+    def _on_ocr_finished_detail(self, resp: object) -> None:
+        # Expecting: {ok:true, text:str, items:[{text,box,score}], orig_size:{w,h}, proc_size:{w,h}}
+        if not isinstance(resp, dict):
+            self._set_status("OCR Error: invalid response")
+            self._set_busy(False)
+            self.update()
+            return
+
+        raw_text = str(resp.get("text") or "").strip()
+        items = resp.get("items") or []
+        if not raw_text and not items:
+            self._set_status("OCR finished: no text detected.")
+            self._set_busy(False)
+            self.update()
+            return
+
+        pix = self._captured_pixmap
+        if pix is None or pix.isNull() or self._selection_rect is None:
+            self._set_status("OCR Error: Missing image.")
+            self._set_busy(False)
+            self.update()
+            return
+
+        try:
+            orig_w = int((resp.get("orig_size") or {}).get("w") or pix.width())
+            orig_h = int((resp.get("orig_size") or {}).get("h") or pix.height())
+        except Exception:
+            orig_w, orig_h = pix.width(), pix.height()
+        try:
+            proc_w = int((resp.get("proc_size") or {}).get("w") or orig_w)
+            proc_h = int((resp.get("proc_size") or {}).get("h") or orig_h)
+        except Exception:
+            proc_w, proc_h = orig_w, orig_h
+
+        # Build token boxes in *original* pixmap space.
+        token_boxes = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            t = str(it.get("text") or "").strip()
+            box = it.get("box")
+            if not t or not isinstance(box, (list, tuple)):
+                continue
+            xs = []
+            ys = []
+            for p in box:
+                if not isinstance(p, (list, tuple)) or len(p) != 2:
+                    continue
+                try:
+                    xs.append(float(p[0]))
+                    ys.append(float(p[1]))
+                except Exception:
+                    pass
+            if not xs or not ys:
+                continue
+
+            # Map from processed OCR image space back to original pixmap space.
+            sx = (orig_w / float(proc_w)) if proc_w else 1.0
+            sy = (orig_h / float(proc_h)) if proc_h else 1.0
+            x0 = min(xs) * sx
+            x1 = max(xs) * sx
+            y0 = min(ys) * sy
+            y1 = max(ys) * sy
+            token_boxes.append({"text": t, "x0": x0, "x1": x1, "y0": y0, "y1": y1})
+
+        if not token_boxes:
+            # Fallback to classic block overlay.
+            self._on_ocr_finished(raw_text)
+            return
+
+        # Sort and group into lines.
+        token_boxes.sort(key=lambda d: (d["y0"], d["x0"]))
+        heights = [(tb["y1"] - tb["y0"]) for tb in token_boxes if (tb["y1"] - tb["y0"]) > 0]
+        median_h = sorted(heights)[len(heights) // 2] if heights else 12.0
+        y_thresh = max(6.0, 0.65 * float(median_h))
+
+        lines = []
+        current = None
+        for tb in token_boxes:
+            yc = 0.5 * (tb["y0"] + tb["y1"])
+            if current is None:
+                current = {"tokens": [tb], "yc": yc}
+                continue
+            if abs(yc - current["yc"]) <= y_thresh:
+                current["tokens"].append(tb)
+                # update running center
+                current["yc"] = (current["yc"] * 0.7) + (yc * 0.3)
+            else:
+                lines.append(current)
+                current = {"tokens": [tb], "yc": yc}
+        if current is not None:
+            lines.append(current)
+
+        # Normalize tokens order inside line by x.
+        for ln in lines:
+            ln["tokens"].sort(key=lambda d: d["x0"])
+
+        # Map to overlay selection rect space.
+        sel = self._selection_rect
+        try:
+            mx = sel.width() / float(orig_w) if orig_w else 1.0
+            my = sel.height() / float(orig_h) if orig_h else 1.0
+        except Exception:
+            mx, my = 1.0, 1.0
+
+        overlay_lines = []
+        for ln in lines:
+            toks = ln["tokens"]
+            text = " ".join([t["text"] for t in toks]).strip()
+            if not text:
+                continue
+            x0 = min(t["x0"] for t in toks) * mx + sel.x()
+            x1 = max(t["x1"] for t in toks) * mx + sel.x()
+            y0 = min(t["y0"] for t in toks) * my + sel.y()
+            y1 = max(t["y1"] for t in toks) * my + sel.y()
+            yc = 0.5 * (y0 + y1)
+            overlay_lines.append({"src": text, "x0": x0, "x1": x1, "y0": y0, "y1": y1, "yc": yc})
+
+        if not overlay_lines:
+            self._on_ocr_finished(raw_text)
+            return
+
+        overlay_lines.sort(key=lambda d: d["yc"])
+
+        # Build non-overlapping bands between lines (Lens-like).
+        band_pad = 4
+        inner_pad = 10
+        inner = QRect(sel.x() + inner_pad, sel.y() + inner_pad, max(10, sel.width() - 2 * inner_pad), max(10, sel.height() - 2 * inner_pad))
+
+        y_centers = [d["yc"] for d in overlay_lines]
+        bands = []
+        for i, d in enumerate(overlay_lines):
+            if i == 0:
+                top = max(float(inner.y()), float(d["y0"]) - 2 * band_pad)
+            else:
+                top = 0.5 * (y_centers[i - 1] + y_centers[i])
+            if i == len(overlay_lines) - 1:
+                bottom = min(float(inner.y() + inner.height()), float(d["y1"]) + 2 * band_pad)
+            else:
+                bottom = 0.5 * (y_centers[i] + y_centers[i + 1])
+
+            top_i = int(max(inner.y(), top))
+            bot_i = int(min(inner.y() + inner.height(), bottom))
+            if bot_i - top_i < 10:
+                continue
+            bands.append({"band": QRect(inner.x(), top_i, inner.width(), bot_i - top_i), "src": d["src"]})
+
+        if not bands:
+            self._on_ocr_finished(raw_text)
+            return
+
+        self._lens_lines = [{"band": b["band"], "text": "", "src": b["src"]} for b in bands]
+
+        source_lang = str(
+            self.settings.value(SETTINGS_TRANSLATION_SOURCE_LANGUAGE, DEFAULT_TRANSLATION_SOURCE_LANGUAGE)
+            or DEFAULT_TRANSLATION_SOURCE_LANGUAGE
+        )
+        target_lang = str(
+            self.settings.value(SETTINGS_TRANSLATION_LANGUAGE, DEFAULT_TRANSLATION_LANGUAGE)
+            or DEFAULT_TRANSLATION_LANGUAGE
+        )
+        engine = str(
+            self.settings.value(SETTINGS_TRANSLATION_ENGINE, DEFAULT_TRANSLATION_ENGINE)
+            or DEFAULT_TRANSLATION_ENGINE
+        ).strip().lower()
+
+        self._set_status("Translating (offline)…" if engine != "public" else "Translating (online)…")
+        self._set_busy(True, "Translating…")
+        self.update()
+
+        lines_to_translate = [b["src"] for b in bands]
+
+        class _TranslateLinesWorker(QObject):
+            finished = Signal(object)
+            error = Signal(str)
+
+            def __init__(self, lines: list[str], target: str, source: str | None, parent=None):
+                super().__init__(parent)
+                self._lines = lines
+                self._target = target
+                self._source = source
+                self._public = PublicAiClient()
+                self._argos = LocalArgosTranslateClient()
+
+            def run(self) -> None:
+                try:
+                    settings = QSettings(ORG_NAME, APP_NAME)
+                    engine = str(settings.value(SETTINGS_TRANSLATION_ENGINE, DEFAULT_TRANSLATION_ENGINE) or DEFAULT_TRANSLATION_ENGINE).strip().lower()
+                    auto_models = bool(settings.value(SETTINGS_TRANSLATION_AUTO_DOWNLOAD_MODELS, True, type=bool))
+                    out = []
+                    for s in self._lines:
+                        if not (s or "").strip():
+                            out.append("")
+                            continue
+                        if engine == "public":
+                            out.append(self._public.translate_text(s, self._target))
+                        else:
+                            out.append(self._argos.translate_text(s, self._source or DEFAULT_TRANSLATION_SOURCE_LANGUAGE, self._target, auto_models))
+                    self.finished.emit(out)
+                except Exception as e:
+                    self.error.emit(str(e))
+
+        try:
+            self._tx_thread = QThread(self)
+            self._tx_worker = _TranslateLinesWorker(lines=lines_to_translate, target=target_lang, source=source_lang)
+            self._tx_worker.moveToThread(self._tx_thread)
+            self._tx_thread.started.connect(self._tx_worker.run)
+
+            def _ok(translated_lines: object) -> None:
+                if isinstance(translated_lines, list):
+                    for i in range(min(len(self._lens_lines), len(translated_lines))):
+                        self._lens_lines[i]["text"] = str(translated_lines[i] or "").strip()
+                    self._set_status("Done (Esc to close)")
+                    self._set_busy(False)
+                else:
+                    self._set_status("Translate error: invalid response")
+                    self._set_busy(False)
+                self.update()
+
+            def _err(msg: str) -> None:
+                detail = str(msg or "Translate failed")
+                self._set_status("Translate error (F1 for details)", detail=detail)
+                self._set_busy(False)
+                self.update()
+
+            self._tx_worker.finished.connect(_ok)
+            self._tx_worker.error.connect(_err)
+            self._tx_worker.finished.connect(lambda *_: self._cleanup_translate_thread())
+            self._tx_worker.error.connect(lambda *_: self._cleanup_translate_thread())
+            self._tx_thread.start()
+        except Exception as e:
+            detail = f"Translate error: {e}\n\nTraceback:\n{traceback.format_exc()}"
+            self._set_status("Translate error (F1 for details)", detail=detail)
+            self.update()
+
+    def _cleanup_translate_thread(self) -> None:
+        try:
+            if self._tx_thread is not None and self._tx_thread.isRunning():
+                self._tx_thread.quit()
+                self._tx_thread.wait(1500)
+        except Exception:
+            pass
+        self._tx_thread = None
+        self._tx_worker = None
+
+    def _on_translate_error(self, message: str) -> None:
+        detail = str(message or "Translate failed")
+        self._set_status("Translate error (F1 for details)", detail=detail)
+        self._set_busy(False)
+        self.update()
+
+    def _on_translate_finished(self, translated: str) -> None:
+        self._translated_text = (translated or "").strip()
+        self._set_status("Done (Esc to close)" if self._translated_text else "Translation returned empty text.")
+        self._set_busy(False)
+        self.update()
+
+    def keyPressEvent(self, event):  # noqa: N802
+        try:
+            if event.key() == Qt.Key_Escape:
+                self.close()
+                event.accept()
+                return
+
+            if event.key() == Qt.Key_F1:
+                detail = (self._status_detail or "").strip()
+                if detail:
+                    self._show_details_dialog("Details", detail)
+                event.accept()
+                return
+
+            if event.matches(QKeySequence.Copy):
+                # Prefer copying error details if present; otherwise copy translation.
+                text = (self._status_detail or "").strip()
+                if not text:
+                    if self._lens_lines:
+                        text = "\n".join([str(ln.get("text") or "").strip() for ln in self._lens_lines if str(ln.get("text") or "").strip()])
+                    else:
+                        text = (self._translated_text or "").strip()
+                if text:
+                    QApplication.clipboard().setText(text)
+                event.accept()
+                return
+        except Exception:
+            pass
+
+        super().keyPressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        self.close()
+        event.accept()
+
+    def _fit_font_to_rect(self, painter: QPainter, rect: QRect, text: str, start_pt: int) -> QFont:
+        pt = max(8, int(start_pt))
+        while pt > 8:
+            font = QFont("Segoe UI", pt)
+            painter.setFont(font)
+            fm = QFontMetrics(font)
+            br = fm.boundingRect(rect, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, text)
+            if br.height() <= rect.height() and br.width() <= rect.width():
+                return font
+            pt -= 1
+        return QFont("Segoe UI", 8)
+
+    def paintEvent(self, event):  # noqa: N802
+        # In fullscreen-auto mode we want a Lens-like overlay: keep the screen visible (no global dimming
+        # and no selection visuals), then draw translated bands on top.
+        if self._fullscreen_auto:
+            painter = QPainter(self)
+            # Draw each screen capture in its logical position.
+            for cap in self.captures:
+                try:
+                    painter.drawPixmap(cap["log_rect"], cap["pixmap"])
+                except Exception:
+                    pass
+        else:
+            super().paintEvent(event)
+            painter = QPainter(self)
+
+        # Status line (always)
+        try:
+            status_rect = QRect(10, 8, self.width() - 20, 26)
+            painter.fillRect(status_rect, QColor(0, 0, 0, 140))
+            painter.setPen(QColor(255, 255, 255))
+            painter.setFont(QFont("Segoe UI", 11))
+            fm = QFontMetrics(painter.font())
+            text = fm.elidedText(str(self._status or ""), Qt.ElideRight, max(10, status_rect.width() - 16))
+            painter.drawText(status_rect.adjusted(8, 0, -8, 0), Qt.AlignLeft | Qt.AlignVCenter, text)
+        except Exception:
+            pass
+
+        if not self._selection_rect:
+            return
+
+        # Lens-like mode: draw per-line translated bands when available.
+        if self._lens_lines:
+            rect = self._selection_rect
+            for ln in self._lens_lines:
+                band = ln.get("band")
+                text = str(ln.get("text") or "").strip()
+                if not isinstance(band, QRect) or not text:
+                    continue
+                try:
+                    painter.fillRect(band, QColor(255, 255, 255, 220))
+                except Exception:
+                    pass
+                try:
+                    start_pt = max(9, min(26, int(band.height() / 2.2)))
+                    font = self._fit_font_to_rect(painter, band.adjusted(6, 2, -6, -2), text, start_pt=start_pt)
+                    painter.setFont(font)
+                    painter.setPen(QColor(0, 0, 0))
+                    painter.drawText(band.adjusted(6, 2, -6, -2), Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter, text)
+                except Exception:
+                    pass
+            return
+
+        # Fallback: classic block overlay.
+        if not self._translated_text:
+            return
+
+        rect = self._selection_rect
+        pad = 10
+        inner = QRect(
+            rect.x() + pad,
+            rect.y() + pad,
+            max(10, rect.width() - 2 * pad),
+            max(10, rect.height() - 2 * pad),
+        )
+
+        # Darken selection and overlay translated text
+        try:
+            painter.fillRect(rect, QColor(0, 0, 0, 150))
+        except Exception:
+            pass
+
+        try:
+            start_pt = max(10, min(34, int(rect.height() / 16)))
+            font = self._fit_font_to_rect(painter, inner, self._translated_text, start_pt=start_pt)
+            painter.setFont(font)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(inner, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, self._translated_text)
+        except Exception:
+            pass
+
+
 class TrayApp:
     def __init__(self):
         self.app = QApplication(sys.argv)
@@ -4252,6 +5848,7 @@ class TrayApp:
         # Signal for communication between keyboard thread and GUI thread
         self.signal_handler = HotkeySignal()
         self.signal_handler.hotkey_pressed.connect(self.on_hotkey_main_thread)
+        self.signal_handler.translate_pressed.connect(self.on_translate_hotkey_main_thread)
 
         icon_path = resource_path("ico.ico")
         self.tray_icon = QSystemTrayIcon(QIcon(icon_path))
@@ -4268,9 +5865,10 @@ class TrayApp:
         self.tray_icon.activated.connect(self.on_tray_icon_activated)
         self.tray_icon.show()
 
-        self.register_hotkey()
+        self.register_hotkeys()
         
         self.snipping_overlay = None
+        self.translation_overlay = None
 
     def notify_existing_instance(self):
         """Notify existing instance to show config window"""
@@ -4292,25 +5890,48 @@ class TrayApp:
                 self.show_settings("general")
             client.disconnectFromServer()
 
-    def register_hotkey(self):
+    def register_hotkeys(self):
+        # Main hotkey
         if self.current_hotkey:
             try:
                 keyboard.remove_hotkey(self.current_hotkey)
-            except:
+            except Exception:
                 pass
-        
+
         hotkey = self.settings.value(SETTINGS_HOTKEY, DEFAULT_HOTKEY)
-        self.current_hotkey = hotkey.lower().replace("ctrl", "control")
-        
+        self.current_hotkey = str(hotkey or DEFAULT_HOTKEY).lower().replace("ctrl", "control")
+
         try:
             keyboard.add_hotkey(self.current_hotkey, self.on_hotkey_pressed)
-        except:
+        except Exception:
             pass
+
+        # Translation hotkey
+        if getattr(self, "translation_hotkey", None):
+            try:
+                keyboard.remove_hotkey(self.translation_hotkey)
+            except Exception:
+                pass
+
+        t_hotkey = self.settings.value(SETTINGS_TRANSLATION_HOTKEY, DEFAULT_TRANSLATION_HOTKEY)
+        self.translation_hotkey = str(t_hotkey or DEFAULT_TRANSLATION_HOTKEY).lower().replace("ctrl", "control")
+
+        try:
+            keyboard.add_hotkey(self.translation_hotkey, self.on_translate_hotkey_pressed)
+        except Exception:
+            pass
+
+    # Backward compatibility (older code paths)
+    def register_hotkey(self):
+        self.register_hotkeys()
 
     def on_hotkey_pressed(self):
         # Keyboard library callback runs in another thread
         # Must emit signal for GUI thread
         self.signal_handler.hotkey_pressed.emit()
+
+    def on_translate_hotkey_pressed(self):
+        self.signal_handler.translate_pressed.emit()
 
     def on_hotkey_main_thread(self):
         # Toggle overlay: if running, close; else open
@@ -4339,6 +5960,26 @@ class TrayApp:
             pass
         self.snipping_overlay.show_fullscreen_custom()
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Overlay shown")
+
+    def on_translate_hotkey_main_thread(self):
+        # Toggle translation overlay
+        if self.translation_overlay:
+            try:
+                if self.translation_overlay.isVisible():
+                    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Translation overlay closed")
+                    self.translation_overlay.close()
+                    return
+            except RuntimeError:
+                self.translation_overlay = None
+
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Translation overlay enabled")
+        self.translation_overlay = TranslationSnippingOverlay(tray_app=self)
+        try:
+            self.translation_overlay.destroyed.connect(lambda *_: setattr(self, "translation_overlay", None))
+        except Exception:
+            pass
+        self.translation_overlay.show_fullscreen_custom()
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Translation overlay shown")
 
     def open_editor(self, pixmap: QPixmap):
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Opening editor")
@@ -4416,6 +6057,12 @@ class TrayApp:
             return False
 
     def quit(self):
+        if getattr(self, "translation_overlay", None):
+            try:
+                self.translation_overlay.close()
+            except Exception:
+                pass
+            self.translation_overlay = None
         if self.ocr_assistant_flow is not None:
             try:
                 self.ocr_assistant_flow.shutdown()
@@ -4436,6 +6083,12 @@ class TrayApp:
         except Exception:
             pass
         self.ocr_service = None
+
+        if getattr(self, "translation_hotkey", None):
+            try:
+                keyboard.remove_hotkey(self.translation_hotkey)
+            except Exception:
+                pass
 
         if self.current_hotkey:
             try:

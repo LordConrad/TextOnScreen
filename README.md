@@ -19,6 +19,8 @@ I created this as a formal and, if I may say so, **"quite useful"** solution for
   - OCR engine (pick one):
     - **Windows OCR (fast, recommended on Windows):** `pip install winsdk`
     - **PaddleOCR (ML models):** `pip install paddlepaddle paddleocr`
+  - Offline translation (optional, open-source):
+    - `pip install argostranslate`
 - Run: `python main.py`
 
 ## Key Features
@@ -34,6 +36,22 @@ I created this as a formal and, if I may say so, **"quite useful"** solution for
 - **Assistant Output UX (new):** optional Markdown output mode (rendered in-app), with visible loading/progress while generating.
 - **Security:** API key encryption using Windows DPAPI.
 - **Customization:** Support for dark/light mode (including system settings) and configurable hotkeys.
+
+## Translation Overlay (offline-capable)
+
+There is an additional hotkey-driven workflow:
+
+- **Settings → Translation**
+  - **Source** language (or Auto)
+  - **Target** language
+  - **Engine**:
+    - **Offline (Argos Translate, open-source)** (default)
+    - **Online (Public AI provider)** (fallback)
+
+When using Offline (Argos Translate):
+
+- The first use of a new language pair may download a model package once (if enabled in settings).
+- Models are stored under `%LOCALAPPDATA%\TxtOnScrn\ArgosTranslate\...`.
 
 ## OCR Settings
 
